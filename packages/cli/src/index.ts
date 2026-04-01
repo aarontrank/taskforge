@@ -13,6 +13,9 @@ import {
   initTaskForge,
   RecurrenceSchema,
 } from '@taskforge/core';
+import { spawn } from 'child_process';
+import path from 'path';
+import { createRequire } from 'module';
 
 const VERSION = '0.1.0';
 
@@ -1067,6 +1070,83 @@ hookCmd
       respond(true, 'hook.test', results, [], [], useJson);
     } catch (err) {
       handleError(err, 'hook.test', useJson);
+    }
+  });
+
+// ─── web ──────────────────────────────────────────────────────────────────────
+
+program
+  .command('web')
+  .description('Start the TaskForge web UI')
+  .option('--port <port>', 'Port to listen on', '3847')
+  .option('--root <path>', 'Override root path')
+  .action(async (opts, cmd) => {
+    const globalOpts = cmd.parent?.opts() ?? {};
+    const root = opts.root ?? globalOpts.root ?? getRootFromEnv();
+    const port = opts.port;
+
+    // Verify .taskforge directory exists
+    const fs = await import('fs');
+    if (!fs.existsSync(root)) {
+      console.error(`Error: TaskForge root not found at ${root}`);
+      console.error('Run "taskforge init" first to create a TaskForge repository.');
+      process.exit(1);
+    }
+
+    // Resolve the @taskforge/web package directory
+    let webPkgDir: string;
+    try {
+      // Use __filename for CJS bundle compatibility (esbuild polyfills it)
+      const req = createRequire(__filename);
+      const webPkgJson = req.resolve('@taskforge/web/package.json');
+      webPkgDir = path.dirname(webPkgJson);
+    } catch {
+      console.error('Error: Could not find @taskforge/web package.');
+      console.error('Make sure @taskforge/web is installed (npm install in the taskforge repo).');
+      process.exit(1);
+    }
+
+    // Resolve the next binary
+    let nextBin: string;
+    try {
+      const req = createRequire(path.join(webPkgDir, 'index.js'));
+      nextBin = req.resolve('next/dist/bin/next');
+    } catch {
+      // Fallback: try npx-style resolution
+      nextBin = path.join(webPkgDir, 'node_modules', '.bin', 'next');
+    }
+
+    console.log(`Starting TaskForge Web UI...`);
+    console.log(`  Root:  ${root}`);
+    console.log(`  Port:  ${port}`);
+    console.log(`  URL:   http://localhost:${port}`);
+    console.log();
+
+    const child = spawn(process.execPath, [nextBin, 'dev', '-p', port], {
+      cwd: webPkgDir,
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        TASKFORGE_ROOT: root,
+        PORT: port,
+      },
+    });
+
+    child.on('error', (err) => {
+      console.error(`Failed to start web server: ${err.message}`);
+      process.exit(1);
+    });
+
+    child.on('exit', (code) => {
+      process.exit(code ?? 0);
+    });
+
+    // Forward termination signals to the child
+    const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
+    for (const sig of signals) {
+      process.on(sig, () => {
+        child.kill(sig);
+      });
     }
   });
 

@@ -52,14 +52,13 @@ npm run uninstall:global
 
 ## Quick Start
 
-Initialize a TaskForge repository in your project directory:
+Initialize the TaskForge repository:
 
 ```bash
-cd ~/my-project
 taskforge init
 ```
 
-This creates a `.taskforge/` directory with the default `main` workspace.
+This creates `~/.taskforge/` with the default `main` workspace. All data is stored in this single location regardless of where you run commands.
 
 Add yourself as an owner:
 
@@ -102,10 +101,10 @@ npm run dev:web
 
 Then open **http://localhost:3847**
 
-By default the UI reads from `.taskforge/` in the repo directory. To point it at a different location:
+The UI reads from `~/.taskforge/` by default — the same location the CLI uses. To override:
 
 ```bash
-TASKFORGE_ROOT=/path/to/your/project/.taskforge npm run dev:web
+TASKFORGE_ROOT=/path/to/custom/.taskforge npm run dev:web
 ```
 
 For production:
@@ -119,10 +118,10 @@ npm start --workspace=packages/web
 
 ## Data Storage
 
-All data lives in a `.taskforge/` directory, typically at the root of your project:
+All data lives in `~/.taskforge/`, a single repository shared by the CLI and web UI:
 
 ```
-.taskforge/
+~/.taskforge/
   config.json          # global config and hook definitions
   owners.json          # owner registry
   task_counter.json    # global ID sequence
@@ -157,7 +156,7 @@ All commands accept:
 | Flag | Description |
 |------|-------------|
 | `--json` | Output a JSON envelope instead of human-readable text |
-| `--root <path>` | Override the `.taskforge` root directory |
+| `--root <path>` | Override the `~/.taskforge` root directory |
 
 Mutation commands also accept:
 - `--actor <name>` — who is performing the action (required)
@@ -188,7 +187,7 @@ On error, `ok` is `false` and `errors` contains `{ code, message }` objects.
 taskforge init [--workspace <name>] [--root <path>]
 ```
 
-Initializes a `.taskforge/` directory and creates the default workspace.
+Initializes `~/.taskforge/` and creates the default workspace. Use `--root` to override the location.
 
 ---
 
@@ -375,7 +374,7 @@ If the current version does not match, the command fails with `CONFLICT_VERSION_
 
 ### Hooks
 
-Hooks fire local commands in response to task lifecycle events. They are configured in `.taskforge/config.json` and executed after the mutation is committed — hook failures do not roll back the task change.
+Hooks fire local commands in response to task lifecycle events. They are configured in `~/.taskforge/config.json` and executed after the mutation is committed — hook failures do not roll back the task change.
 
 #### Supported events
 
@@ -388,7 +387,7 @@ Hooks fire local commands in response to task lifecycle events. They are configu
 
 #### Configuration
 
-Edit `.taskforge/config.json`:
+Edit `~/.taskforge/config.json`:
 
 ```json
 {

@@ -1,7 +1,8 @@
 import path from 'path';
+import os from 'os';
 
 export function getDefaultRoot(): string {
-  return path.join(process.cwd(), '.taskforge');
+  return path.join(os.homedir(), '.taskforge');
 }
 
 export function getRootFromEnv(): string {

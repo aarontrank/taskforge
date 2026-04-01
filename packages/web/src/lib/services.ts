@@ -1,8 +1,9 @@
 import { WorkspaceStorage, OwnerStorage, ConfigStorage, TaskService, WorkspaceService, OwnerService } from '@taskforge/core';
 import path from 'path';
+import os from 'os';
 
 function getRoot(): string {
-  return process.env.TASKFORGE_ROOT || path.join(process.cwd(), '.taskforge');
+  return process.env.TASKFORGE_ROOT || path.join(os.homedir(), '.taskforge');
 }
 
 export function getServices() {
