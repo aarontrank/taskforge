@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# TypeScript build output
+packages/*/dist/
+
+# Next.js
+packages/web/.next/
+packages/web/out/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Test data
+.taskforge/
