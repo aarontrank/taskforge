@@ -7,7 +7,10 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::path::PathBuf;
 use taskforge_core::fsstore::FsStore;
-use taskforge_core::model::{Owner, OwnerType, Task, TaskStatus};
+use taskforge_core::hooks::{HookConfig, HookEngine};
+use taskforge_core::model::{
+    DueStrategy, Owner, OwnerType, Recurrence, RecurrenceFrequency, Task, TaskStatus,
+};
 use taskforge_core::service::{TaskError, TaskService};
 use taskforge_core::store::TaskStore;
 
@@ -95,6 +98,20 @@ enum Top {
         #[command(subcommand)]
         command: TaskCmd,
     },
+    /// Manage workspaces.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCmd {
+    Add {
+        #[arg(long)]
+        name: String,
+    },
+    List,
 }
 
 #[derive(Subcommand)]
@@ -121,6 +138,9 @@ enum TaskCmd {
         description: Option<String>,
         #[arg(long)]
         review_required: bool,
+        /// Parent task, making this a subtask. One level of nesting only.
+        #[arg(long)]
+        parent: Option<String>,
     },
     Show {
         #[arg(long)]
@@ -129,6 +149,9 @@ enum TaskCmd {
     List {
         #[arg(long)]
         status: Option<String>,
+        /// Include archived and soft-deleted tasks, which are hidden by default.
+        #[arg(long)]
+        archived: bool,
     },
     /// open|pending -> running
     Start(Act),
@@ -165,6 +188,122 @@ enum TaskCmd {
     },
     AddWorklog(Note),
     AddComment(Note),
+    SetTitle {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        actor: String,
+    },
+    SetDescription {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        description: String,
+        #[arg(long)]
+        actor: String,
+    },
+    Assign {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        actor: String,
+    },
+    SetReviewer {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        reviewer: String,
+        #[arg(long)]
+        actor: String,
+    },
+    SetDue {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        due_at: String,
+        #[arg(long)]
+        actor: String,
+    },
+    SetReviewRequired {
+        #[arg(long)]
+        id: String,
+        /// `ArgAction::Set` so this reads `--value true`, matching the documented surface. A
+        /// bare `bool` would make it a flag and reject the explicit value.
+        #[arg(long, action = clap::ArgAction::Set)]
+        value: bool,
+        #[arg(long)]
+        actor: String,
+    },
+    RemoveBlocker {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        blocked_by: String,
+        #[arg(long)]
+        actor: String,
+    },
+    /// Recurrence schedule for a task.
+    SetRecurrence {
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_parser = ["hourly", "daily", "weekly", "monthly"])]
+        frequency: String,
+        #[arg(long, default_value_t = 1)]
+        interval: u32,
+        #[arg(long, value_parser = ["none", "relative", "absolute"], default_value = "none")]
+        due_strategy: String,
+        #[arg(long)]
+        actor: String,
+    },
+    ClearRecurrence {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        actor: String,
+    },
+    Tree {
+        #[arg(long)]
+        id: String,
+    },
+    Search {
+        #[arg(long)]
+        text: String,
+    },
+    Audit {
+        #[arg(long)]
+        id: String,
+    },
+    AddAttachment(FileRef),
+    AddArtifact(FileRef),
+    Archive {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        actor: String,
+    },
+    SoftDelete {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        actor: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct FileRef {
+    #[arg(long)]
+    id: String,
+    #[arg(long)]
+    path: PathBuf,
+    /// `copy` duplicates the file into the task folder; `link` records the path only.
+    #[arg(long, value_parser = ["copy", "link"], default_value = "copy")]
+    mode: String,
+    #[arg(long)]
+    actor: String,
 }
 
 #[derive(clap::Args)]
@@ -204,6 +343,16 @@ fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {
                 .unwrap_or_default();
             home.join(".taskforge")
         })
+}
+
+/// Hooks declared in `config.json`. A malformed or absent config yields no hooks rather than
+/// an error: task management must keep working when the notification config is broken.
+fn load_hooks(root: &std::path::Path) -> Vec<HookConfig> {
+    std::fs::read_to_string(root.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| serde_json::from_value(v.get("hooks")?.clone()).ok())
+        .unwrap_or_default()
 }
 
 fn owners_path(root: &std::path::Path) -> PathBuf {
@@ -286,6 +435,24 @@ fn main() {
         },
 
         Top::Task { command } => run_task(command, store, &root, &cli.workspace),
+
+        Top::Workspace { command } => match command {
+            WorkspaceCmd::Add { name } => {
+                let label = "workspace add";
+                let ws = FsStore::new(&root, &name);
+                match ws.init() {
+                    Ok(()) => Envelope::ok(label, serde_json::json!({"name": name})).emit(),
+                    Err(e) => Envelope::err(label, "IO_ERROR", e.to_string()).emit(),
+                }
+            }
+            WorkspaceCmd::List => {
+                let names: Vec<serde_json::Value> = FsStore::workspaces(&root)
+                    .into_iter()
+                    .map(|n| serde_json::json!({"name": n}))
+                    .collect();
+                Envelope::ok("workspace list", serde_json::json!(names)).emit()
+            }
+        },
     }
 }
 
@@ -302,6 +469,7 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             actor: _,
             description,
             review_required,
+            parent,
         } => {
             let label = "task create";
             if !load_owners(root).iter().any(|o| o.name == owner) {
@@ -316,9 +484,15 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
                 Ok(id) => id,
                 Err(e) => Envelope::err(label, "IO_ERROR", e.to_string()).emit(),
             };
+            if let Some(p) = &parent {
+                if store.get(p).is_none() {
+                    fail(label, TaskError::NotFound(p.clone()));
+                }
+            }
             let mut task = Task::new(&id, &title, workspace, &owner, now());
             task.description = description;
             task.review_required = review_required;
+            task.parent_task_id = parent;
             store.put(task.clone());
             Envelope::ok(label, serde_json::to_value(task).unwrap_or_default()).emit()
         }
@@ -331,16 +505,12 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             }
         }
 
-        TaskCmd::List { status } => {
+        TaskCmd::List { status, archived } => {
             let label = "task list";
-            let dir = root.join("workspaces").join(workspace).join("tasks");
-            let mut tasks: Vec<Task> = std::fs::read_dir(&dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| e.file_name().to_str().map(String::from))
-                .filter_map(|id| store.get(&id))
-                .collect();
+            let mut tasks: Vec<Task> = store.list();
+            if !archived {
+                tasks.retain(|t| !t.archived && !t.soft_deleted);
+            }
             if let Some(want) = status {
                 match TaskStatus::parse(&want) {
                     Ok(s) => tasks.retain(|t| t.status == s),
@@ -351,14 +521,16 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             Envelope::ok(label, serde_json::to_value(tasks).unwrap_or_default()).emit()
         }
 
-        TaskCmd::Start(a) => transition("task start", store, a, TaskStatus::Running),
+        TaskCmd::Start(a) => transition("task start", store, root, a, TaskStatus::Running),
         TaskCmd::RequestReview(a) => {
-            transition("task request-review", store, a, TaskStatus::InReview)
+            transition("task request-review", store, root, a, TaskStatus::InReview)
         }
-        TaskCmd::Merge(a) => transition("task merge", store, a, TaskStatus::Merged),
-        TaskCmd::Accept(a) => transition("task accept", store, a, TaskStatus::Done),
-        TaskCmd::Complete(a) => transition("task complete", store, a, TaskStatus::Done),
-        TaskCmd::Reject(a) => transition("task reject", store, a, TaskStatus::ChangesRequested),
+        TaskCmd::Merge(a) => transition("task merge", store, root, a, TaskStatus::Merged),
+        TaskCmd::Accept(a) => transition("task accept", store, root, a, TaskStatus::Done),
+        TaskCmd::Complete(a) => transition("task complete", store, root, a, TaskStatus::Done),
+        TaskCmd::Reject(a) => {
+            transition("task reject", store, root, a, TaskStatus::ChangesRequested)
+        }
 
         TaskCmd::SetReview {
             id,
@@ -430,13 +602,223 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
                 Err(e) => Envelope::err(label, "IO_ERROR", e.to_string()).emit(),
             }
         }
+
+        TaskCmd::SetTitle {
+            id,
+            title,
+            actor: _,
+        } => patch("task set-title", &mut store, &id, |t| t.title = title),
+        TaskCmd::SetDescription {
+            id,
+            description,
+            actor: _,
+        } => patch("task set-description", &mut store, &id, |t| {
+            t.description = Some(description)
+        }),
+        TaskCmd::Assign {
+            id,
+            owner,
+            actor: _,
+        } => {
+            let label = "task assign";
+            if !load_owners(root).iter().any(|o| o.name == owner) {
+                Envelope::err(
+                    label,
+                    "OWNER_NOT_FOUND",
+                    format!("owner not in registry: {owner}"),
+                )
+                .emit();
+            }
+            patch(label, &mut store, &id, |t| t.owner = owner)
+        }
+        TaskCmd::SetReviewer {
+            id,
+            reviewer,
+            actor: _,
+        } => {
+            let label = "task set-reviewer";
+            if !load_owners(root).iter().any(|o| o.name == reviewer) {
+                Envelope::err(
+                    label,
+                    "OWNER_NOT_FOUND",
+                    format!("owner not in registry: {reviewer}"),
+                )
+                .emit();
+            }
+            patch(label, &mut store, &id, |t| t.reviewer = Some(reviewer))
+        }
+        TaskCmd::SetDue {
+            id,
+            due_at,
+            actor: _,
+        } => patch("task set-due", &mut store, &id, |t| t.due_at = Some(due_at)),
+        TaskCmd::SetReviewRequired {
+            id,
+            value,
+            actor: _,
+        } => patch("task set-review-required", &mut store, &id, |t| {
+            t.review_required = value
+        }),
+        TaskCmd::RemoveBlocker {
+            id,
+            blocked_by,
+            actor: _,
+        } => patch("task remove-blocker", &mut store, &id, |t| {
+            t.blocked_by.retain(|b| b != &blocked_by)
+        }),
+        TaskCmd::SetRecurrence {
+            id,
+            frequency,
+            interval,
+            due_strategy,
+            actor: _,
+        } => {
+            let freq = match frequency.as_str() {
+                "hourly" => RecurrenceFrequency::Hourly,
+                "daily" => RecurrenceFrequency::Daily,
+                "weekly" => RecurrenceFrequency::Weekly,
+                _ => RecurrenceFrequency::Monthly,
+            };
+            let strat = match due_strategy.as_str() {
+                "relative" => DueStrategy::Relative,
+                "absolute" => DueStrategy::Absolute,
+                _ => DueStrategy::None,
+            };
+            patch("task set-recurrence", &mut store, &id, |t| {
+                t.recurrence = Some(Recurrence {
+                    frequency: freq,
+                    interval,
+                    preserve_review_required: true,
+                    carry_forward_description: true,
+                    carry_forward_owner: true,
+                    carry_forward_due_strategy: strat,
+                })
+            })
+        }
+        TaskCmd::ClearRecurrence { id, actor: _ } => {
+            patch("task clear-recurrence", &mut store, &id, |t| {
+                t.recurrence = None
+            })
+        }
+        TaskCmd::Tree { id } => {
+            let label = "task tree";
+            let Some(root_task) = store.get(&id) else {
+                fail(label, TaskError::NotFound(id))
+            };
+            // One level of nesting only, matching the documented model.
+            let kids: Vec<Task> = store
+                .list()
+                .into_iter()
+                .filter(|t| t.parent_task_id.as_deref() == Some(root_task.id.as_str()))
+                .collect();
+            let mut data = serde_json::to_value(&root_task).unwrap_or_default();
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert(
+                    "subtasks".into(),
+                    serde_json::to_value(kids).unwrap_or_default(),
+                );
+            }
+            Envelope::ok(label, data).emit()
+        }
+        TaskCmd::Search { text } => {
+            let needle = text.to_lowercase();
+            let hits: Vec<Task> = store
+                .list()
+                .into_iter()
+                .filter(|t| {
+                    t.title.to_lowercase().contains(&needle)
+                        || t.description
+                            .as_deref()
+                            .map(|d| d.to_lowercase().contains(&needle))
+                            .unwrap_or(false)
+                })
+                .collect();
+            Envelope::ok(
+                "task search",
+                serde_json::to_value(hits).unwrap_or_default(),
+            )
+            .emit()
+        }
+        TaskCmd::Audit { id } => {
+            let label = "task audit";
+            if store.get(&id).is_none() {
+                fail(label, TaskError::NotFound(id));
+            }
+            Envelope::ok(
+                label,
+                serde_json::to_value(store.audit(&id)).unwrap_or_default(),
+            )
+            .emit()
+        }
+        TaskCmd::AddAttachment(f) => attach("task add-attachment", &mut store, f, "attachments"),
+        TaskCmd::AddArtifact(f) => attach("task add-artifact", &mut store, f, "artifacts"),
+        TaskCmd::Archive { id, actor: _ } => {
+            let label = "task archive";
+            match store.get(&id) {
+                Some(t) if t.archived => Envelope::err(
+                    label,
+                    "ALREADY_ARCHIVED",
+                    format!("{id} is already archived"),
+                )
+                .emit(),
+                Some(_) => patch(label, &mut store, &id, |t| t.archived = true),
+                None => fail(label, TaskError::NotFound(id)),
+            }
+        }
+        TaskCmd::SoftDelete { id, actor: _ } => patch("task soft-delete", &mut store, &id, |t| {
+            t.soft_deleted = true
+        }),
     }
 }
 
-fn transition(label: &str, store: FsStore, a: Act, to: TaskStatus) -> ! {
-    let mut svc = TaskService::new(store, now());
+fn transition(label: &str, store: FsStore, root: &std::path::Path, a: Act, to: TaskStatus) -> ! {
+    let mut svc = TaskService::new(store, now()).with_hooks(HookEngine::new(load_hooks(root)));
     match svc.set_status(&a.id, to, &a.actor, a.version) {
-        Ok(t) => Envelope::ok(label, serde_json::to_value(t).unwrap_or_default()).emit(),
+        Ok(t) => {
+            // A recurring completion produces a successor; report it so the caller is not
+            // left guessing whether one was created.
+            let mut data = serde_json::to_value(t).unwrap_or_default();
+            if let (Some(obj), Some(next)) = (data.as_object_mut(), svc.last_generated.as_ref()) {
+                obj.insert("next_occurrence_id".into(), serde_json::json!(next));
+            }
+            Envelope::ok(label, data).emit()
+        }
         Err(e) => fail(label, e),
     }
+}
+
+/// Record an attachment or artifact reference on a task.
+fn attach(label: &str, store: &mut FsStore, f: FileRef, kind: &str) -> ! {
+    if store.get(&f.id).is_none() {
+        fail(label, TaskError::NotFound(f.id));
+    }
+    let code = if kind == "attachments" {
+        "ATTACHMENT_NOT_FOUND"
+    } else {
+        "ARTIFACT_NOT_FOUND"
+    };
+    let reference = match store.attach(&f.id, kind, &f.path, f.mode == "copy") {
+        Ok(r) => r,
+        Err(e) => Envelope::err(label, code, e.to_string()).emit(),
+    };
+    patch(label, store, &f.id, |t| {
+        if kind == "attachments" {
+            t.attachment_refs.push(reference);
+        } else {
+            t.artifact_refs.push(reference);
+        }
+    })
+}
+
+/// Read, mutate, and write back a task, bumping its version. Used by every patch-style
+/// setter, so they all agree on the version/timestamp bookkeeping.
+fn patch(label: &str, store: &mut FsStore, id: &str, f: impl FnOnce(&mut Task)) -> ! {
+    let Some(mut task) = store.get(id) else {
+        fail(label, TaskError::NotFound(id.to_string()))
+    };
+    f(&mut task);
+    task.updated_at = now();
+    task.version += 1;
+    store.put(task.clone());
+    Envelope::ok(label, serde_json::to_value(task).unwrap_or_default()).emit()
 }

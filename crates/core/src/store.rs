@@ -23,6 +23,9 @@ pub trait TaskStore {
     fn get(&self, id: &str) -> Option<Task>;
     fn put(&mut self, task: Task);
     fn append_audit(&mut self, entry: AuditEntry);
+    /// Allocate the next task id. On the trait because generating a recurring task's next
+    /// occurrence is domain logic that has to mint an id without knowing the storage kind.
+    fn allocate_id(&mut self) -> String;
 }
 
 /// In-memory store for tests.
@@ -30,6 +33,7 @@ pub trait TaskStore {
 pub struct MemoryStore {
     tasks: std::collections::BTreeMap<String, Task>,
     audit: Vec<AuditEntry>,
+    next: u64,
 }
 
 impl MemoryStore {
@@ -58,5 +62,10 @@ impl TaskStore for MemoryStore {
 
     fn append_audit(&mut self, entry: AuditEntry) {
         self.audit.push(entry);
+    }
+
+    fn allocate_id(&mut self) -> String {
+        self.next += 1;
+        format!("TASK-{:04}", self.next + 1000)
     }
 }

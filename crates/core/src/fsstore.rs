@@ -93,6 +93,80 @@ impl FsStore {
         )
     }
 
+    /// Ids of every task folder in the workspace, sorted.
+    pub fn list_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = std::fs::read_dir(self.workspace_dir().join("tasks"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Every task in the workspace, sorted by id.
+    pub fn list(&self) -> Vec<Task> {
+        self.list_ids()
+            .iter()
+            .filter_map(|id| self.get(id))
+            .collect()
+    }
+
+    /// Parsed audit entries for a task, oldest first. Unparseable lines are skipped rather
+    /// than aborting the read: a corrupt line must not hide the rest of the history.
+    pub fn audit(&self, id: &str) -> Vec<AuditEntry> {
+        std::fs::read_to_string(self.task_dir(id).join("audit.log"))
+            .map(|t| {
+                t.lines()
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Place a file under `attachments/` or `artifacts/`.
+    ///
+    /// `copy` duplicates the bytes into the task folder; `link` records only the path. A
+    /// missing source is an error either way — recording a reference to a file that is not
+    /// there turns a typo into silent data loss.
+    pub fn attach(
+        &self,
+        id: &str,
+        kind: &str,
+        src: &std::path::Path,
+        copy: bool,
+    ) -> std::io::Result<String> {
+        if !src.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no such file: {}", src.display()),
+            ));
+        }
+        if !copy {
+            return Ok(src.display().to_string());
+        }
+        let name = src.file_name().unwrap_or_default();
+        let dir = self.task_dir(id).join(kind);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::copy(src, dir.join(name))?;
+        Ok(format!("{kind}/{}", name.to_string_lossy()))
+    }
+
+    /// The workspaces present under this root.
+    pub fn workspaces(root: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root.join("workspaces"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Render `task.md`: frontmatter fence, then the human-facing body.
     fn render(task: &Task) -> String {
         let yaml = serde_yaml::to_string(task).unwrap_or_default();
@@ -122,6 +196,13 @@ impl TaskStore for FsStore {
         if let Ok(line) = serde_json::to_string(&entry) {
             let _ = self.append_line(&entry.task_id.clone(), "audit.log", &line);
         }
+    }
+
+    fn allocate_id(&mut self) -> String {
+        // A failed allocation must not silently reuse an id, so fall back to a timestamp
+        // rather than to a fixed value.
+        self.next_id()
+            .unwrap_or_else(|_| format!("TASK-ERR-{}", std::process::id()))
     }
 }
 

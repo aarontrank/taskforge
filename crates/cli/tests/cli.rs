@@ -240,3 +240,376 @@ fn review_id_expected_by_and_worker_are_settable_and_persist() {
     assert_eq!(shown["data"]["expected_by"], "2026-09-03T17:00:00Z");
     assert_eq!(shown["data"]["worker"], "addresscr-CR-301625168");
 }
+
+/// Create a task and return its id.
+fn mk(root: &std::path::Path, title: &str) -> String {
+    let (_, v) = run(
+        root,
+        &[
+            "task", "create", "--title", title, "--owner", "agent", "--actor", "agent", "--json",
+        ],
+    );
+    v["data"]["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn the_patch_style_setters_each_change_exactly_their_own_field() {
+    let d = setup();
+    let id = mk(d.path(), "before");
+    run(
+        d.path(),
+        &["owner", "add", "--name", "rev", "--type", "human", "--json"],
+    );
+
+    for (args, field, expected) in [
+        (vec!["set-title", "--title", "after"], "title", "after"),
+        (
+            vec!["set-description", "--description", "why"],
+            "description",
+            "why",
+        ),
+        (vec!["assign", "--owner", "rev"], "owner", "rev"),
+        (vec!["set-reviewer", "--reviewer", "rev"], "reviewer", "rev"),
+        (
+            vec!["set-due", "--due-at", "2026-12-01T00:00:00Z"],
+            "due_at",
+            "2026-12-01T00:00:00Z",
+        ),
+    ] {
+        let mut cmd = vec!["task", args[0], "--id", &id];
+        cmd.extend_from_slice(&args[1..]);
+        cmd.extend_from_slice(&["--actor", "agent", "--json"]);
+        let (ok, r) = run(d.path(), &cmd);
+        assert!(ok, "{} succeeds: {r}", args[0]);
+        assert_eq!(r["data"][field], expected, "after {}", args[0]);
+    }
+
+    let (_, r) = run(
+        d.path(),
+        &[
+            "task",
+            "set-review-required",
+            "--id",
+            &id,
+            "--value",
+            "true",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert_eq!(r["data"]["review_required"], true);
+}
+
+#[test]
+fn a_blocker_can_be_removed_again() {
+    let d = setup();
+    let a = mk(d.path(), "a");
+    let b = mk(d.path(), "b");
+    run(
+        d.path(),
+        &[
+            "task",
+            "add-blocker",
+            "--id",
+            &b,
+            "--blocked-by",
+            &a,
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task",
+            "remove-blocker",
+            "--id",
+            &b,
+            "--blocked-by",
+            &a,
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(ok);
+    assert_eq!(r["data"]["blocked_by"].as_array().unwrap().len(), 0);
+    // With the blocker gone, the task starts.
+    let (ok, _) = run(
+        d.path(),
+        &["task", "start", "--id", &b, "--actor", "agent", "--json"],
+    );
+    assert!(ok, "an unblocked task starts");
+}
+
+#[test]
+fn a_subtask_records_its_parent_and_appears_in_the_tree() {
+    let d = setup();
+    let parent = mk(d.path(), "parent");
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task", "create", "--title", "child", "--owner", "agent", "--actor", "agent",
+            "--parent", &parent, "--json",
+        ],
+    );
+    assert!(ok, "subtask create succeeds: {v}");
+    assert_eq!(v["data"]["parent_task_id"], parent);
+
+    let (_, tree) = run(d.path(), &["task", "tree", "--id", &parent, "--json"]);
+    assert_eq!(tree["data"]["id"], parent);
+    let kids = tree["data"]["subtasks"].as_array().expect("subtasks array");
+    assert_eq!(kids.len(), 1);
+    assert_eq!(kids[0]["title"], "child");
+}
+
+#[test]
+fn search_matches_title_and_description_but_not_unrelated_tasks() {
+    let d = setup();
+    mk(d.path(), "port the storage layer");
+    let other = mk(d.path(), "unrelated");
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-description",
+            "--id",
+            &other,
+            "--description",
+            "mentions storage",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    mk(d.path(), "nothing to see");
+
+    let (_, r) = run(d.path(), &["task", "search", "--text", "storage", "--json"]);
+    let hits = r["data"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "title and description both match: {r}");
+
+    let (_, none) = run(
+        d.path(),
+        &["task", "search", "--text", "zzznotpresent", "--json"],
+    );
+    assert_eq!(none["data"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn attachments_and_artifacts_record_refs_and_copy_or_link() {
+    let d = setup();
+    let id = mk(d.path(), "with files");
+    let src = d.path().join("spec.txt");
+    std::fs::write(&src, "hello").unwrap();
+
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task",
+            "add-attachment",
+            "--id",
+            &id,
+            "--path",
+            src.to_str().unwrap(),
+            "--mode",
+            "copy",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(ok, "copy attachment: {r}");
+    assert_eq!(r["data"]["attachment_refs"].as_array().unwrap().len(), 1);
+    let copied = d
+        .path()
+        .join("workspaces/main/tasks")
+        .join(&id)
+        .join("attachments/spec.txt");
+    assert!(
+        copied.is_file(),
+        "copy mode places the file in the task folder"
+    );
+
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task",
+            "add-artifact",
+            "--id",
+            &id,
+            "--path",
+            src.to_str().unwrap(),
+            "--mode",
+            "link",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(ok, "link artifact: {r}");
+    assert_eq!(
+        r["data"]["artifact_refs"][0],
+        src.to_str().unwrap(),
+        "link mode stores the path"
+    );
+    let linked = d
+        .path()
+        .join("workspaces/main/tasks")
+        .join(&id)
+        .join("artifacts/spec.txt");
+    assert!(!linked.exists(), "link mode copies nothing");
+}
+
+#[test]
+fn a_missing_attachment_source_is_reported_not_silently_recorded() {
+    let d = setup();
+    let id = mk(d.path(), "x");
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task",
+            "add-attachment",
+            "--id",
+            &id,
+            "--path",
+            "/nope/missing.txt",
+            "--mode",
+            "copy",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(!ok);
+    assert_eq!(r["errors"][0]["code"], "ATTACHMENT_NOT_FOUND");
+}
+
+#[test]
+fn archive_and_soft_delete_set_flags_and_hide_from_the_default_listing() {
+    let d = setup();
+    let keep = mk(d.path(), "keep");
+    let gone = mk(d.path(), "archive me");
+    let deleted = mk(d.path(), "delete me");
+
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task", "archive", "--id", &gone, "--actor", "agent", "--json",
+        ],
+    );
+    assert!(ok);
+    assert_eq!(r["data"]["archived"], true);
+    // The new model keeps status orthogonal: archiving does not overwrite it.
+    assert_eq!(
+        r["data"]["status"], "open",
+        "archived is a flag, not a status"
+    );
+
+    run(
+        d.path(),
+        &[
+            "task",
+            "soft-delete",
+            "--id",
+            &deleted,
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+
+    let (_, listed) = run(d.path(), &["task", "list", "--json"]);
+    let ids: Vec<&str> = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![keep.as_str()],
+        "only the live task is listed by default"
+    );
+
+    let (_, all) = run(d.path(), &["task", "list", "--archived", "--json"]);
+    assert!(all["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["id"] == gone.as_str()));
+}
+
+#[test]
+fn workspaces_can_be_created_and_listed_and_isolate_their_tasks() {
+    let d = setup();
+    mk(d.path(), "in main");
+    let (ok, _) = run(d.path(), &["workspace", "add", "--name", "side", "--json"]);
+    assert!(ok, "workspace add succeeds");
+
+    let (_, ws) = run(d.path(), &["workspace", "list", "--json"]);
+    let names: Vec<&str> = ws["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"main") && names.contains(&"side"),
+        "got {names:?}"
+    );
+
+    let (_, side) = run(d.path(), &["--workspace", "side", "task", "list", "--json"]);
+    assert_eq!(
+        side["data"].as_array().unwrap().len(),
+        0,
+        "the new workspace is empty"
+    );
+}
+
+#[test]
+fn the_audit_trail_is_readable_through_the_cli() {
+    let d = setup();
+    let id = mk(d.path(), "audited");
+    run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "aaron", "--json"],
+    );
+    let (ok, r) = run(d.path(), &["task", "audit", "--id", &id, "--json"]);
+    assert!(ok);
+    let entries = r["data"].as_array().unwrap();
+    assert!(!entries.is_empty(), "the status change is recorded");
+    assert_eq!(entries.last().unwrap()["to"], "running");
+    assert_eq!(entries.last().unwrap()["actor"], "aaron");
+}
+
+#[test]
+fn a_hook_configured_in_config_json_fires_on_a_real_status_change() {
+    let d = setup();
+    let marker = d.path().join("hook-ran.json");
+    let config = serde_json::json!({
+        "default_workspace": "main",
+        "hooks": [{
+            "id": "capture",
+            "enabled": true,
+            "event": "task.status_changed",
+            "command": "sh",
+            "args": ["-c", format!("cat > {}", marker.display())],
+            "timeout_ms": 5000
+        }]
+    });
+    std::fs::write(d.path().join("config.json"), config.to_string()).unwrap();
+
+    let id = mk(d.path(), "hooked");
+    let (ok, _) = run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+    );
+    assert!(ok);
+
+    let body = std::fs::read_to_string(&marker).expect("the configured hook actually ran");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["task_id"], id);
+    assert_eq!(v["status"], "running");
+}
