@@ -613,3 +613,93 @@ fn a_hook_configured_in_config_json_fires_on_a_real_status_change() {
     assert_eq!(v["task_id"], id);
     assert_eq!(v["status"], "running");
 }
+
+#[test]
+fn archiving_an_already_archived_task_is_refused() {
+    let d = setup();
+    let id = mk(d.path(), "x");
+    run(
+        d.path(),
+        &["task", "archive", "--id", &id, "--actor", "agent", "--json"],
+    );
+    let (ok, r) = run(
+        d.path(),
+        &["task", "archive", "--id", &id, "--actor", "agent", "--json"],
+    );
+    assert!(!ok);
+    assert_eq!(r["errors"][0]["code"], "ALREADY_ARCHIVED");
+}
+
+#[test]
+fn an_unrecognized_status_filter_is_reported() {
+    let d = setup();
+    let (ok, r) = run(
+        d.path(),
+        &["task", "list", "--status", "in_progress", "--json"],
+    );
+    assert!(!ok, "the old snake_case name is no longer a status");
+    assert_eq!(r["errors"][0]["code"], "INVALID_STATUS");
+}
+
+#[test]
+fn creating_a_task_for_an_unregistered_owner_is_refused() {
+    let d = setup();
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task", "create", "--title", "x", "--owner", "ghost", "--actor", "agent", "--json",
+        ],
+    );
+    assert!(!ok);
+    assert_eq!(r["errors"][0]["code"], "OWNER_NOT_FOUND");
+}
+
+#[test]
+fn registering_the_same_owner_twice_is_refused() {
+    let d = setup();
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "owner", "add", "--name", "agent", "--type", "agent", "--json",
+        ],
+    );
+    assert!(!ok);
+    assert_eq!(r["errors"][0]["code"], "OWNER_EXISTS");
+}
+
+#[test]
+fn assigning_to_an_unregistered_owner_is_refused() {
+    let d = setup();
+    let id = mk(d.path(), "x");
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task", "assign", "--id", &id, "--owner", "ghost", "--actor", "agent", "--json",
+        ],
+    );
+    assert!(!ok);
+    assert_eq!(r["errors"][0]["code"], "OWNER_NOT_FOUND");
+}
+
+#[test]
+fn creating_a_subtask_of_a_nonexistent_parent_is_refused() {
+    let d = setup();
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task",
+            "create",
+            "--title",
+            "orphan",
+            "--owner",
+            "agent",
+            "--actor",
+            "agent",
+            "--parent",
+            "TASK-9999",
+            "--json",
+        ],
+    );
+    assert!(!ok);
+    assert_eq!(r["errors"][0]["code"], "TASK_NOT_FOUND");
+}

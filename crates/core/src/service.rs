@@ -710,4 +710,61 @@ mod tests {
             .is_ok());
         assert!(s.last_hook_results.is_empty());
     }
+
+    #[test]
+    fn an_unparseable_due_date_yields_no_due_date_rather_than_a_panic() {
+        let mut s = svc();
+        let mut t = recurring(
+            "TASK-0001",
+            RecurrenceFrequency::Daily,
+            Some("not-a-timestamp"),
+            DueStrategy::Absolute,
+        );
+        t.status = TaskStatus::Running;
+        s.store.put(t);
+        s.set_status("TASK-0001", TaskStatus::Done, "a", None)
+            .unwrap();
+        let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
+        assert!(
+            n.due_at.is_none(),
+            "a bad date is dropped, not propagated or panicked on"
+        );
+    }
+
+    #[test]
+    fn a_due_strategy_with_no_prior_due_date_carries_nothing() {
+        let mut s = svc();
+        s.store.put(recurring(
+            "TASK-0001",
+            RecurrenceFrequency::Daily,
+            None,
+            DueStrategy::Absolute,
+        ));
+        s.set_status("TASK-0001", TaskStatus::Done, "a", None)
+            .unwrap();
+        let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
+        assert!(n.due_at.is_none());
+    }
+
+    #[test]
+    fn carry_forward_owner_false_leaves_the_successor_unassigned() {
+        let mut s = svc();
+        let mut t = recurring(
+            "TASK-0001",
+            RecurrenceFrequency::Daily,
+            None,
+            DueStrategy::None,
+        );
+        if let Some(r) = t.recurrence.as_mut() {
+            r.carry_forward_owner = false;
+        }
+        s.store.put(t);
+        s.set_status("TASK-0001", TaskStatus::Done, "a", None)
+            .unwrap();
+        let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
+        assert!(
+            n.owner.is_empty(),
+            "the successor needs assigning rather than inheriting"
+        );
+    }
 }

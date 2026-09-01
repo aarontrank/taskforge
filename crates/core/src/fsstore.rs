@@ -329,4 +329,40 @@ mod tests {
         assert!(cm.contains("a question") && cm.contains("kiro"));
         assert!(!wl.contains("a question"), "the two logs stay separate");
     }
+
+    #[test]
+    fn a_task_file_with_no_frontmatter_fence_reads_as_none() {
+        let (d, mut s) = root();
+        s.put(task("TASK-0001"));
+        let f = d.path().join("workspaces/main/tasks/TASK-0001/task.md");
+        std::fs::write(&f, "just a body, no fence\n").unwrap();
+        assert!(
+            s.get("TASK-0001").is_none(),
+            "a malformed file is absent, not a panic"
+        );
+    }
+
+    #[test]
+    fn a_task_file_with_unparseable_frontmatter_reads_as_none() {
+        let (d, mut s) = root();
+        s.put(task("TASK-0001"));
+        let f = d.path().join("workspaces/main/tasks/TASK-0001/task.md");
+        std::fs::write(&f, "---\nid: [unclosed\n---\n\nbody\n").unwrap();
+        assert!(s.get("TASK-0001").is_none());
+    }
+
+    #[test]
+    fn attaching_a_missing_source_file_is_an_error() {
+        let (_d, mut s) = root();
+        s.put(task("TASK-0001"));
+        let err = s
+            .attach(
+                "TASK-0001",
+                "attachments",
+                std::path::Path::new("/nope/x.txt"),
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
 }
