@@ -81,10 +81,19 @@ returns `INVALID_STATUS_TRANSITION`, and an unknown name returns `INVALID_STATUS
 
 ```bash
 taskforge task set-review --id TASK-0001 --actor agent --json \
-  [--review-id CR-301625168] [--expected-by 2026-09-03T17:00:00Z] [--worker addresscr-CR-301625168]
+  [--review-id CR-301625168] [--expected-by 2026-09-03T17:00:00Z]
+
+taskforge task set-worker --id TASK-0001 --actor agent --json \
+  [--worker addresscr-CR-301625168] [--checkout 3]
 ```
 
 Omitted flags leave the current value alone, so one field can be set without clearing the others.
+
+**`--checkout` is not `--workspace`.** `--checkout` records the *development* workspace the work
+happens in — an `imdb-next-gen` number, a git worktree name, a sandbox id. The global
+`--workspace` flag selects which taskforge *partition* the task is filed in (`main`, `side`).
+Putting a per-stream checkout id in `--workspace` would file every stream in its own partition
+and break `task list`.
 
 ## Patch-style updates
 

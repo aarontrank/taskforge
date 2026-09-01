@@ -198,7 +198,7 @@ fn an_unknown_task_reports_task_not_found() {
 }
 
 #[test]
-fn review_id_expected_by_and_worker_are_settable_and_persist() {
+fn review_id_and_expected_by_are_settable_and_persist() {
     let d = setup();
     let (_, v) = run(
         d.path(),
@@ -226,8 +226,6 @@ fn review_id_expected_by_and_worker_are_settable_and_persist() {
             "CR-301625168",
             "--expected-by",
             "2026-09-03T17:00:00Z",
-            "--worker",
-            "addresscr-CR-301625168",
             "--actor",
             "agent",
             "--json",
@@ -238,7 +236,6 @@ fn review_id_expected_by_and_worker_are_settable_and_persist() {
     let (_, shown) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
     assert_eq!(shown["data"]["review_id"], "CR-301625168");
     assert_eq!(shown["data"]["expected_by"], "2026-09-03T17:00:00Z");
-    assert_eq!(shown["data"]["worker"], "addresscr-CR-301625168");
 }
 
 /// Create a task and return its id.
@@ -785,4 +782,108 @@ fn set_status_rejects_a_status_name_that_does_not_exist() {
         ],
     );
     assert!(!ok, "an unknown status name must not be accepted");
+}
+
+#[test]
+fn the_dev_checkout_is_a_separate_field_from_the_task_partition() {
+    let d = setup();
+    let id = mk(d.path(), "S1");
+    // `workspace` partitions the task store (main, side). `checkout` is the dev workspace the
+    // work happens in (an imdb-next-gen number, a worktree name). Conflating them would shard
+    // the task store one-per-stream and break `task list`.
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task",
+            "set-worker",
+            "--id",
+            &id,
+            "--worker",
+            "IMDbNextGen3",
+            "--checkout",
+            "3",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(ok, "set-worker succeeds: {r}");
+    assert_eq!(r["data"]["worker"], "IMDbNextGen3");
+    assert_eq!(r["data"]["checkout"], "3");
+    assert_eq!(
+        r["data"]["workspace"], "main",
+        "the task partition is untouched"
+    );
+
+    let (_, shown) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(shown["data"]["checkout"], "3", "and it persists");
+}
+
+#[test]
+fn set_worker_and_set_review_each_leave_the_other_pair_alone() {
+    let d = setup();
+    let id = mk(d.path(), "S1");
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-review",
+            "--id",
+            &id,
+            "--review-id",
+            "CR-1",
+            "--expected-by",
+            "2026-09-03T17:00:00Z",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-worker",
+            "--id",
+            &id,
+            "--worker",
+            "w1",
+            "--checkout",
+            "7",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+
+    let (_, r) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(
+        r["data"]["review_id"], "CR-1",
+        "set-worker did not clear the review fields"
+    );
+    assert_eq!(r["data"]["expected_by"], "2026-09-03T17:00:00Z");
+    assert_eq!(r["data"]["worker"], "w1");
+    assert_eq!(r["data"]["checkout"], "7");
+
+    // And an omitted flag leaves its own field alone rather than nulling it.
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-worker",
+            "--id",
+            &id,
+            "--checkout",
+            "8",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    let (_, r2) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(
+        r2["data"]["worker"], "w1",
+        "worker survived a checkout-only update"
+    );
+    assert_eq!(r2["data"]["checkout"], "8");
 }

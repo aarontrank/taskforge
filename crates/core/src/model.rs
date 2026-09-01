@@ -206,6 +206,15 @@ pub struct Task {
     /// Worker holding this task, e.g. a tmux session name.
     #[serde(default)]
     pub worker: Option<String>,
+    /// Development checkout the work happens in — an `imdb-next-gen` workspace number, a git
+    /// worktree name, a sandbox id.
+    ///
+    /// Deliberately **not** `workspace`, which on this struct means the taskforge partition
+    /// (`main`, `side`) that the task is filed under. They are different things that both get
+    /// called "workspace" in conversation: putting a per-stream checkout id in `workspace`
+    /// would file every stream in its own partition and break listing.
+    #[serde(default)]
+    pub checkout: Option<String>,
     #[serde(default = "one_i64")]
     pub version: i64,
 }
@@ -251,6 +260,7 @@ impl Task {
             review_id: None,
             expected_by: None,
             worker: None,
+            checkout: None,
             version: 1,
         }
     }

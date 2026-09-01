@@ -183,7 +183,7 @@ enum TaskCmd {
         #[arg(long)]
         status: String,
     },
-    /// Record which review gates this task, when the wait is overdue, and who holds it.
+    /// Record which review gates this task and when the wait becomes overdue.
     SetReview {
         #[arg(long)]
         id: String,
@@ -193,8 +193,20 @@ enum TaskCmd {
         review_id: Option<String>,
         #[arg(long)]
         expected_by: Option<String>,
+    },
+    /// Record who holds this task and which development checkout they hold it in.
+    ///
+    /// `--checkout` is the dev workspace (an imdb-next-gen number, a worktree name), which is
+    /// a different thing from the global `--workspace` flag that selects a taskforge partition.
+    SetWorker {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        actor: String,
         #[arg(long)]
         worker: Option<String>,
+        #[arg(long)]
+        checkout: Option<String>,
     },
     AddBlocker {
         #[arg(long)]
@@ -567,28 +579,32 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             actor: _,
             review_id,
             expected_by,
-            worker,
         } => {
-            let label = "task set-review";
-            let Some(mut task) = store.get(&id) else {
-                fail(label, TaskError::NotFound(id))
-            };
-            // Absent flags leave the current value alone, so one field can be set without
-            // clearing the other two.
-            if review_id.is_some() {
-                task.review_id = review_id;
-            }
-            if expected_by.is_some() {
-                task.expected_by = expected_by;
-            }
-            if worker.is_some() {
-                task.worker = worker;
-            }
-            task.updated_at = now();
-            task.version += 1;
-            store.put(task.clone());
-            Envelope::ok(label, serde_json::to_value(task).unwrap_or_default()).emit()
+            // An absent flag leaves its own field alone, so one can be set without clearing
+            // the other.
+            patch("task set-review", &mut store, &id, |t| {
+                if review_id.is_some() {
+                    t.review_id = review_id;
+                }
+                if expected_by.is_some() {
+                    t.expected_by = expected_by;
+                }
+            })
         }
+
+        TaskCmd::SetWorker {
+            id,
+            actor: _,
+            worker,
+            checkout,
+        } => patch("task set-worker", &mut store, &id, |t| {
+            if worker.is_some() {
+                t.worker = worker;
+            }
+            if checkout.is_some() {
+                t.checkout = checkout;
+            }
+        }),
 
         TaskCmd::AddBlocker {
             id,

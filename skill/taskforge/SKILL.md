@@ -51,8 +51,10 @@ Reaching each state: `task start`, `request-review`, `reject`, `merge`, `accept`
 plus `pending`, `wait`, `block`, `fail`, `cancel` — or `task set-status --status <name>` for any
 of them. All are guarded by the transition table.
 
-Three fields carry the scheduling state: `review_id` (which review gates this), `expected_by`
-(when the wait becomes overdue), `worker` (who holds it). Set them with `task set-review`.
+Four fields carry the execution state: `review_id` (which review gates this) and `expected_by`
+(when the wait becomes overdue) via `task set-review`; `worker` (who holds it) and `checkout`
+(which dev workspace they hold it in) via `task set-worker`. Note `checkout` is the *development*
+workspace — distinct from the global `--workspace` flag, which selects a taskforge partition.
 
 ## The loop
 

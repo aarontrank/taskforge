@@ -19,8 +19,9 @@ actually matter when agents are doing the work:
 That falls out into enforcement you feel immediately: a blocker sitting in `merged` does **not**
 release the task waiting on it, and `task complete` on a review-required task is refused. The
 states are those of an agent-orchestration status board, so a task can also say *which* review
-gates it (`review_id`), *when* the wait becomes overdue (`expected_by`), and *who* holds it
-(`worker`) — which is what separates "in review, on schedule" from "stuck" as data rather than
+gates it (`review_id`), *when* the wait becomes overdue (`expected_by`), *who* holds it
+(`worker`), and *which dev checkout* they hold it in (`checkout`, deliberately distinct from
+taskforge's own `workspace` partition) — which is what separates "in review, on schedule" from "stuck" as data rather than
 as a judgement call.
 
 ```
@@ -179,7 +180,7 @@ The Rust implementation is the only implementation; the earlier TypeScript versi
 Next.js web UI have been removed. Human inspection is the markdown files themselves plus
 `taskforge task list`.
 
-`79` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
+`82` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
 guards, filesystem round-trips, hook execution including timeouts, and the CLI end to end —
 including a test that every one of the eleven statuses is reachable through the binary.
 
