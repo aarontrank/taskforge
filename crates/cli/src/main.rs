@@ -16,6 +16,11 @@ use taskforge_core::store::TaskStore;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Whether to print the JSON envelope. Set once from the parsed flags before anything is
+/// emitted; a global because `emit()` is reached from dozens of places and threading a flag
+/// through every one of them would obscure the code paths it is meant to decorate.
+static JSON_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Serialize)]
 struct Envelope {
     ok: bool,
@@ -58,13 +63,170 @@ impl Envelope {
         }
     }
 
+    /// Print and exit. `--json` prints the envelope; otherwise a human-readable rendering,
+    /// with failures on stderr so stdout stays clean whichever mode is in use.
     fn emit(self) -> ! {
         let code = if self.ok { 0 } else { 1 };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&self).unwrap_or_default()
-        );
+        if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&self).unwrap_or_default()
+            );
+        } else if self.ok {
+            print!("{}", render(&self.command, self.data.as_ref()));
+        } else {
+            for e in &self.errors {
+                eprintln!("error: {}: {}", e.code, e.message);
+            }
+        }
         std::process::exit(code)
+    }
+}
+
+/// Human-readable rendering of a successful response.
+///
+/// Lists become a board-shaped table; a single task becomes a field block; anything else is a
+/// one-line acknowledgement. Deliberately not a general JSON pretty-printer: the point is that
+/// the common cases read at a glance.
+fn render(command: &str, data: Option<&serde_json::Value>) -> String {
+    let Some(data) = data else {
+        return format!("{command}: ok\n");
+    };
+
+    if let Some(rows) = data.as_array() {
+        if rows.is_empty() {
+            return "no tasks\n".to_string();
+        }
+        // A list of tasks renders as the board; any other array (owners, workspaces) as names.
+        if rows[0].get("status").is_none() {
+            let names: Vec<String> = rows.iter().map(summary_line).collect();
+            return names.join("\n") + "\n";
+        }
+        return task_table(rows);
+    }
+
+    if data.get("status").is_some() && data.get("id").is_some() {
+        // A mutation returns the whole task; a human wants one line for that, and the full
+        // block only when they asked to see the task.
+        if command == "task show" {
+            return task_detail(data);
+        }
+        return format!(
+            "{}  {}  {}\n",
+            str_of(data, "id"),
+            str_of(data, "status"),
+            str_of(data, "title")
+        );
+    }
+
+    format!("{}: {}\n", command, summary_line(data))
+}
+
+fn str_of(v: &serde_json::Value, key: &str) -> String {
+    match v.get(key) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Null) | None => "-".to_string(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Best-effort one-line label for a non-task object: its name, else its id, else compact JSON.
+fn summary_line(v: &serde_json::Value) -> String {
+    for key in ["name", "id"] {
+        if let Some(serde_json::Value::String(s)) = v.get(key) {
+            return s.clone();
+        }
+    }
+    v.to_string()
+}
+
+/// The orchestrate board columns, in board order.
+fn task_table(rows: &[serde_json::Value]) -> String {
+    let mut out = format!(
+        "{:<10} {:<19} {:<22} {:<14} {:<21} {}\n",
+        "ID", "STATUS", "WORKER", "REVIEW", "EXPECTED-BY", "TITLE"
+    );
+    for t in rows {
+        let mut title = str_of(t, "title");
+        // Dependencies are why a row is not moving, so they belong in the glance.
+        if let Some(b) = t.get("blocked_by").and_then(|b| b.as_array()) {
+            if !b.is_empty() {
+                let ids: Vec<String> = b
+                    .iter()
+                    .map(|x| x.as_str().unwrap_or("?").to_string())
+                    .collect();
+                title = format!("{title}  [blocked by {}]", ids.join(", "));
+            }
+        }
+        out.push_str(&format!(
+            "{:<10} {:<19} {:<22} {:<14} {:<21} {}\n",
+            str_of(t, "id"),
+            str_of(t, "status"),
+            str_of(t, "worker"),
+            str_of(t, "review_id"),
+            str_of(t, "expected_by"),
+            title
+        ));
+    }
+    out
+}
+
+/// Field block for one task. Empty optional fields are omitted rather than printed as dashes,
+/// so what is shown is what is set.
+fn task_detail(t: &serde_json::Value) -> String {
+    let mut out = format!("{}  {}\n", str_of(t, "id"), str_of(t, "title"));
+    let always = [
+        ("status", "status"),
+        ("owner", "owner"),
+        ("workspace", "workspace"),
+    ];
+    for (label, key) in always {
+        out.push_str(&format!("  {label:<16} {}\n", str_of(t, key)));
+    }
+    let optional = [
+        ("review required", "review_required"),
+        ("reviewer", "reviewer"),
+        ("review", "review_id"),
+        ("expected by", "expected_by"),
+        ("worker", "worker"),
+        ("checkout", "checkout"),
+        ("due", "due_at"),
+        ("completed", "completed_at"),
+        ("parent", "parent_task_id"),
+        ("prior occurrence", "prior_occurrence_id"),
+    ];
+    for (label, key) in optional {
+        match t.get(key) {
+            Some(serde_json::Value::Null) | None => {}
+            Some(serde_json::Value::Bool(false)) => {}
+            Some(v) => out.push_str(&format!("  {label:<16} {}\n", str_of_raw(v))),
+        }
+    }
+    for (label, key) in [
+        ("blocked by", "blocked_by"),
+        ("attachments", "attachment_refs"),
+        ("artifacts", "artifact_refs"),
+    ] {
+        if let Some(a) = t.get(key).and_then(|x| x.as_array()) {
+            if !a.is_empty() {
+                let items: Vec<String> = a.iter().map(str_of_raw).collect();
+                out.push_str(&format!("  {label:<16} {}\n", items.join(", ")));
+            }
+        }
+    }
+    out.push_str(&format!("  {:<16} {}\n", "version", str_of(t, "version")));
+    if let Some(serde_json::Value::String(d)) = t.get("description") {
+        if !d.is_empty() {
+            out.push_str(&format!("\n{d}\n"));
+        }
+    }
+    out
+}
+
+fn str_of_raw(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -77,7 +239,7 @@ struct Cli {
     /// Workspace to operate in.
     #[arg(long, global = true, default_value = "main")]
     workspace: String,
-    /// Emit JSON. Accepted everywhere and always on, since JSON is the only output form.
+    /// Emit the JSON envelope instead of human-readable text. Agents should always pass it.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -398,6 +560,7 @@ fn load_owners(root: &std::path::Path) -> Vec<Owner> {
 
 fn main() {
     let cli = Cli::parse();
+    JSON_OUTPUT.store(cli.json, std::sync::atomic::Ordering::Relaxed);
     let root = resolve_root(cli.root.clone());
     let store = FsStore::new(&root, &cli.workspace);
 

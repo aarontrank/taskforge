@@ -49,6 +49,16 @@ cd taskforge
 cargo install --path crates/cli     # puts `taskforge` on your PATH
 ```
 
+Output is human-readable by default; pass `--json` for the machine envelope:
+
+```
+$ taskforge task list
+ID         STATUS              WORKER                 REVIEW         EXPECTED-BY           TITLE
+TASK-0001  in-review           addresscr-CR-301625168 CR-301625168   2026-09-03T17:00:00Z  S1 crew list
+TASK-0002  merged              -                      -              -                     S2 cast list
+TASK-0003  open                -                      -              -                     S3 shared header  [blocked by TASK-0001]
+```
+
 Run the tests and lints:
 
 ```bash
@@ -180,7 +190,7 @@ The Rust implementation is the only implementation; the earlier TypeScript versi
 Next.js web UI have been removed. Human inspection is the markdown files themselves plus
 `taskforge task list`.
 
-`82` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
+`87` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
 guards, filesystem round-trips, hook execution including timeouts, and the CLI end to end —
 including a test that every one of the eleven statuses is reachable through the binary.
 

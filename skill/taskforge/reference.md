@@ -1,8 +1,12 @@
 # taskforge CLI reference
 
-Every command accepts `--json` (always pass it), `--root <path>` (defaults to
+Every command accepts `--json` (**agents should always pass it**), `--root <path>` (defaults to
 `$TASKFORGE_ROOT`, else `~/.taskforge`), and `--workspace <name>` (defaults to `main`).
 Exit status is 0 on success, 1 on error.
+
+Without `--json` the output is human-readable text: `task list` renders a board-shaped table,
+`task show` a field block, a mutation a single confirmation line, and an error goes to **stderr**
+as `error: CODE: message`. Never parse that form — it is for people.
 
 ## Response envelope
 

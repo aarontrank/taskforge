@@ -887,3 +887,121 @@ fn set_worker_and_set_review_each_leave_the_other_pair_alone() {
     );
     assert_eq!(r2["data"]["checkout"], "8");
 }
+
+/// Run without `--json` and capture stdout/stderr/exit separately.
+fn run_text(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_taskforge"))
+        .args(args)
+        .env("TASKFORGE_ROOT", root)
+        .output()
+        .expect("binary runs");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn without_json_the_list_is_a_readable_table_not_an_envelope() {
+    let d = setup();
+    let id = mk(d.path(), "port the storage layer");
+    run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+    );
+
+    let (ok, out, _) = run_text(d.path(), &["task", "list"]);
+    assert!(ok);
+    assert!(
+        !out.contains("\"taskforge_version\""),
+        "no JSON envelope:\n{out}"
+    );
+    assert!(!out.trim_start().starts_with('{'), "not JSON:\n{out}");
+    assert!(
+        out.contains("ID") && out.contains("STATUS"),
+        "has a header:\n{out}"
+    );
+    assert!(
+        out.contains(&id) && out.contains("running"),
+        "has the row:\n{out}"
+    );
+    assert!(
+        out.contains("port the storage layer"),
+        "has the title:\n{out}"
+    );
+    // A board needs the execution columns, not just id and title.
+    for col in ["WORKER", "REVIEW", "EXPECTED-BY"] {
+        assert!(out.contains(col), "board column {col} missing:\n{out}");
+    }
+}
+
+#[test]
+fn without_json_show_prints_the_fields_a_human_wants() {
+    let d = setup();
+    let id = mk(d.path(), "a stream");
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-worker",
+            "--id",
+            &id,
+            "--worker",
+            "w1",
+            "--checkout",
+            "3",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    let (ok, out, _) = run_text(d.path(), &["task", "show", "--id", &id]);
+    assert!(ok);
+    assert!(!out.trim_start().starts_with('{'), "not JSON:\n{out}");
+    for needle in [id.as_str(), "a stream", "open", "w1", "3"] {
+        assert!(out.contains(needle), "{needle:?} missing from:\n{out}");
+    }
+}
+
+#[test]
+fn json_still_produces_the_envelope_when_asked() {
+    let d = setup();
+    mk(d.path(), "x");
+    let (_, out, _) = run_text(d.path(), &["task", "list", "--json"]);
+    assert!(
+        out.trim_start().starts_with('{'),
+        "still JSON on demand:\n{out}"
+    );
+    assert!(out.contains("\"taskforge_version\""));
+}
+
+#[test]
+fn without_json_a_mutation_confirms_in_one_line() {
+    let d = setup();
+    let (ok, out, _) = run_text(
+        d.path(),
+        &[
+            "task",
+            "create",
+            "--title",
+            "new thing",
+            "--owner",
+            "agent",
+            "--actor",
+            "agent",
+        ],
+    );
+    assert!(ok);
+    assert!(out.lines().count() <= 2, "one line, not a dump:\n{out}");
+    assert!(out.contains("TASK-0001"), "names the new task:\n{out}");
+}
+
+#[test]
+fn without_json_an_error_goes_to_stderr_with_its_code_and_exits_nonzero() {
+    let d = setup();
+    let (ok, out, err) = run_text(d.path(), &["task", "show", "--id", "TASK-9999"]);
+    assert!(!ok, "exit is non-zero");
+    assert!(err.contains("TASK_NOT_FOUND"), "code on stderr:\n{err}");
+    assert!(out.is_empty(), "nothing on stdout for a failure:\n{out}");
+}
