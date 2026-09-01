@@ -21,8 +21,9 @@ release the task waiting on it, and `task complete` on a review-required task is
 states are those of an agent-orchestration status board, so a task can also say *which* review
 gates it (`review_id`), *when* the wait becomes overdue (`expected_by`), *who* holds it
 (`worker`), and *which dev checkout* they hold it in (`checkout`, deliberately distinct from
-taskforge's own `workspace` partition) — which is what separates "in review, on schedule" from "stuck" as data rather than
-as a judgement call.
+taskforge's own `workspace` partition) — which is what separates "in review, on schedule" from
+"stuck" as data rather than as a judgement call. The first two are set with `task set-review`,
+the last two with `task set-worker`.
 
 ```
 open ─→ pending ─→ running ─→ in-review ─→ merged ─→ done
@@ -109,7 +110,7 @@ your real store), or pass `--root <path>` per command.
     main/
       tasks/
         TASK-0001/
-          task.md        # YAML frontmatter + markdown body
+          task.md        # YAML frontmatter, then Summary / Acceptance Criteria / Notes
           worklog.md     # append-only execution log
           comments.md    # append-only discussion
           audit.log      # append-only NDJSON mutation history
@@ -142,6 +143,30 @@ authoritative CLI docs; this README deliberately does not duplicate the whole fl
 The rules that matter for an agent: always `--json`, read before mutating, use patch commands
 rather than editing `task.md`, pass `--actor`, log progress with `add-worklog`, and treat
 `in-review` inside its `expected_by` window as waiting rather than stuck.
+
+---
+
+## Using it as an orchestration board
+
+This is what the eleven states are for. The `orchestrate` skill coordinates parallel work
+streams and keeps a status board of them, and it **prefers taskforge as that board whenever the
+binary is on `PATH`**, falling back to a hand-maintained markdown table when it is not. The
+status vocabulary here is deliberately that board's vocabulary, so one task is one stream.
+
+The reason to prefer it is that it *enforces* what a markdown table can only describe: a stream
+whose blockers are unresolved cannot be dispatched, a review-gated stream cannot be completed
+directly, every change lands in an audit log, and `merged` is not `done`. A table can be written
+into any state by any worker, correct or not.
+
+Two things to know if you wire it up:
+
+- **The store is chosen once, at setup, and recorded.** Not per operation — a `PATH` difference
+  mid-run would switch stores and orphan whatever was already recorded.
+- **Waves and the critical path are not stored here.** They stay in the upstream plan artifact,
+  so ordering is read from the plan against this board.
+
+`taskforge task list` renders the board columns directly. The operation-by-operation mapping
+lives in the `orchestrate` skill rather than here, so there is one copy of it.
 
 ---
 
