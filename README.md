@@ -50,6 +50,13 @@ cd taskforge
 cargo install --path crates/cli     # puts `taskforge` on your PATH
 ```
 
+Re-run that same command after pulling changes; it overwrites in place. To remove the binary
+later: `cargo uninstall taskforge-cli`.
+
+`cargo install` refreshes the crates.io index, so it needs network even when every dependency is
+already cached — offline or in a sandbox it fails with `Could not resolve host: index.crates.io`.
+Add `--locked --offline` there and it builds from the committed lockfile.
+
 Output is human-readable by default; pass `--json` for the machine envelope:
 
 ```
@@ -72,6 +79,10 @@ There is no CI on this repository, so nothing runs those but you. Run them befor
 ---
 
 ## Quick start
+
+`init` and at least one `owner add` are **both required**, and every later `--owner`/`--actor` is
+validated against that registry — skip them and each `task create` fails with
+`OWNER_NOT_FOUND`. Both are idempotent, so re-running them is safe.
 
 ```bash
 taskforge init --json
