@@ -1,10 +1,11 @@
 {
   "name": "taskforge-root",
   "private": true,
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "dev:web": "npm run dev --workspace=packages/web",
     "dev:cli": "npm run dev --workspace=packages/cli",
     "install:global": "npm run build --workspace=packages/core && npm run build --workspace=packages/cli && npm install -g ./packages/cli",
     "uninstall:global": "npm uninstall -g @taskforge/cli"

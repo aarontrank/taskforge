@@ -1,0 +1,29 @@
+# One Cargo workspace for taskforge. `core` is the domain library, `cli` the binary.
+# Deliberately dependency-light: only well-known crates.io packages, since every
+# dependency here is code this project is now responsible for.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde-well-known", "macros"] }
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+
+# These are small CLI tools run interactively, so favour a fast, small binary over
+# incremental rebuild speed.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

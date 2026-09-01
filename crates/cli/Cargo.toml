@@ -1,0 +1,22 @@
+[package]
+name = "taskforge-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command-line interface for taskforge"
+
+[[bin]]
+name = "taskforge"
+path = "src/main.rs"
+
+[dependencies]
+taskforge-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

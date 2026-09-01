@@ -21,3 +21,6 @@ packages/web/out/
 
 # Test data
 .taskforge/
+
+# Rust
+/target
