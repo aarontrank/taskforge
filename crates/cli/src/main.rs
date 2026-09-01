@@ -1,7 +1,9 @@
 //! taskforge CLI.
 //!
-//! Every command prints the documented JSON envelope and exits non-zero on error, so an agent
-//! can branch on the exit status and read `errors[0].code` without parsing prose.
+//! Two output modes. With `--json` every command prints the documented envelope, so an agent can
+//! branch on the exit status and read `errors[0].code` without parsing prose. Without it, output
+//! is human-readable text and errors go to stderr — that form is for people and is not a
+//! contract.
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
