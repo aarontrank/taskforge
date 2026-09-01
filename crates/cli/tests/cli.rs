@@ -703,3 +703,86 @@ fn creating_a_subtask_of_a_nonexistent_parent_is_refused() {
     assert!(!ok);
     assert_eq!(r["errors"][0]["code"], "TASK_NOT_FOUND");
 }
+
+/// Every status in the model must be reachable through the CLI.
+///
+/// The model having eleven states buys nothing if the binary can only produce six of them.
+/// This walks a real path to each one, so a state that exists only in the enum is a failure.
+#[test]
+fn every_status_in_the_model_is_reachable_through_the_cli() {
+    let d = setup();
+    let paths: &[(&str, &[&str])] = &[
+        ("open", &[]),
+        ("pending", &["pending"]),
+        ("running", &["start"]),
+        ("in-review", &["start", "request-review"]),
+        ("changes-requested", &["start", "request-review", "reject"]),
+        ("merged", &["start", "request-review", "merge"]),
+        ("done", &["start", "request-review", "merge", "accept"]),
+        ("waiting-on-schedule", &["start", "wait"]),
+        ("stuck", &["start", "block"]),
+        ("failed", &["start", "fail"]),
+        ("cancelled", &["cancel"]),
+    ];
+
+    for (want, steps) in paths {
+        let id = mk(d.path(), want);
+        for step in *steps {
+            let (ok, r) = run(
+                d.path(),
+                &["task", step, "--id", &id, "--actor", "agent", "--json"],
+            );
+            assert!(ok, "`task {step}` on the way to {want} failed: {r}");
+        }
+        let (_, shown) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+        assert_eq!(
+            shown["data"]["status"], *want,
+            "path {steps:?} should end at {want}"
+        );
+    }
+}
+
+#[test]
+fn set_status_refuses_a_move_the_transition_table_forbids() {
+    let d = setup();
+    let id = mk(d.path(), "x");
+    // open -> merged is not legal, and the generic setter must be guarded exactly like the
+    // named commands rather than being a way around them.
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task",
+            "set-status",
+            "--id",
+            &id,
+            "--status",
+            "merged",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(!ok);
+    assert_eq!(r["errors"][0]["code"], "INVALID_STATUS_TRANSITION");
+}
+
+#[test]
+fn set_status_rejects_a_status_name_that_does_not_exist() {
+    let d = setup();
+    let id = mk(d.path(), "x");
+    let (ok, _) = run(
+        d.path(),
+        &[
+            "task",
+            "set-status",
+            "--id",
+            &id,
+            "--status",
+            "bogus",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(!ok, "an unknown status name must not be accepted");
+}

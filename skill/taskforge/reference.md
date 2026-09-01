@@ -61,10 +61,21 @@ Each takes `--id`, `--actor`, optional `--version <n>` for optimistic concurrenc
 | `task merge` | in-review → merged | **Not** terminal |
 | `task accept` | merged → done | Human acceptance; the only success terminal |
 | `task complete` | running → done | Fails with `REVIEW_REQUIRED` if review was demanded |
+| `task pending` | open/stuck → pending | Planned into a wave, not yet dispatched |
+| `task wait` | running → waiting-on-schedule | Slow non-review step, still on schedule |
+| `task block` | → stuck | Needs a decision, or a wait passed its `expected_by` |
+| `task fail` | → failed | Attempted and failed. `task start` retries it |
+| `task cancel` | → cancelled | Will never run, e.g. a dependency failed permanently |
+| `task set-status --status <name>` | any legal move | Shorthand for the above; same guard |
 
 ```bash
-taskforge task start --id TASK-0001 --actor agent --version 3 --json
+taskforge task start      --id TASK-0001 --actor agent --version 3 --json
+taskforge task set-status --id TASK-0001 --status stuck --actor agent --json
 ```
+
+All eleven statuses are reachable from the CLI. `set-status` is guarded by the same transition
+table as the named commands, so it is a shorthand, not an escape hatch: an illegal move still
+returns `INVALID_STATUS_TRANSITION`, and an unknown name returns `INVALID_STATUS`.
 
 ## Board fields
 
@@ -168,5 +179,9 @@ The payload arrives as JSON on the hook's **stdin**:
 ```json
 { "event": "task.status_changed", "workspace": "main", "task_id": "TASK-0001", "status": "running" }
 ```
+
+The payload has **no trailing newline**, so a hook appending to an NDJSON log must add one
+itself — `sh -c 'cat >> log; echo >> log'` rather than `cat >> log`, or every event lands on a
+single concatenated line.
 
 A hook exceeding `timeout_ms` is killed and reported with `timed_out: true`.

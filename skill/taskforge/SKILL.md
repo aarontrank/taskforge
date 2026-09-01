@@ -47,6 +47,10 @@ Consequences you will hit:
 - `in-review` within its `expected_by` window is **waiting, not stuck**. Do not escalate it and
   do not mark it `stuck`. Only a wait that has passed `expected_by` is `stuck`.
 
+Reaching each state: `task start`, `request-review`, `reject`, `merge`, `accept`, `complete`,
+plus `pending`, `wait`, `block`, `fail`, `cancel` — or `task set-status --status <name>` for any
+of them. All are guarded by the transition table.
+
 Three fields carry the scheduling state: `review_id` (which review gates this), `expected_by`
 (when the wait becomes overdue), `worker` (who holds it). Set them with `task set-review`.
 

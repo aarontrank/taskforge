@@ -32,7 +32,8 @@ open ─→ pending ─→ running ─→ in-review ─→ merged ─→ done
 ```
 
 Eleven states: `open`, `pending`, `running`, `in-review`, `changes-requested`, `merged`,
-`waiting-on-schedule`, `stuck`, `done`, `failed`, `cancelled`. `archived` and `soft_deleted` are
+`waiting-on-schedule`, `stuck`, `done`, `failed`, `cancelled` — each reachable from the CLI,
+either by its named command or via `task set-status --status <name>`. `archived` and `soft_deleted` are
 orthogonal flags, not statuses, so archiving a task does not erase what state it was in.
 
 ---
@@ -178,8 +179,9 @@ The Rust implementation is the only implementation; the earlier TypeScript versi
 Next.js web UI have been removed. Human inspection is the markdown files themselves plus
 `taskforge task list`.
 
-`64` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
-guards, filesystem round-trips, hook execution including timeouts, and the CLI end to end.
+`79` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
+guards, filesystem round-trips, hook execution including timeouts, and the CLI end to end —
+including a test that every one of the eleven statuses is reachable through the binary.
 
 ## Licence
 

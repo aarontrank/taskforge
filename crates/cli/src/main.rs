@@ -165,6 +165,24 @@ enum TaskCmd {
     Complete(Act),
     /// in-review -> changes-requested
     Reject(Act),
+    /// -> pending: planned into a wave, not yet dispatched
+    Pending(Act),
+    /// -> waiting-on-schedule: in flight on a slow non-review step, still on schedule
+    Wait(Act),
+    /// -> stuck: needs a decision, or a wait has passed its expected-by
+    Block(Act),
+    /// -> failed: attempted and failed. May be retried with `start`
+    Fail(Act),
+    /// -> cancelled: will never run, e.g. a dependency failed permanently
+    Cancel(Act),
+    /// Move to any status by name. Guarded by the same transition table as the named
+    /// commands, so this is a shorthand rather than a way around them.
+    SetStatus {
+        #[command(flatten)]
+        act: Act,
+        #[arg(long)]
+        status: String,
+    },
     /// Record which review gates this task, when the wait is overdue, and who holds it.
     SetReview {
         #[arg(long)]
@@ -530,6 +548,18 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
         TaskCmd::Complete(a) => transition("task complete", store, root, a, TaskStatus::Done),
         TaskCmd::Reject(a) => {
             transition("task reject", store, root, a, TaskStatus::ChangesRequested)
+        }
+        TaskCmd::Pending(a) => transition("task pending", store, root, a, TaskStatus::Pending),
+        TaskCmd::Wait(a) => transition("task wait", store, root, a, TaskStatus::WaitingOnSchedule),
+        TaskCmd::Block(a) => transition("task block", store, root, a, TaskStatus::Stuck),
+        TaskCmd::Fail(a) => transition("task fail", store, root, a, TaskStatus::Failed),
+        TaskCmd::Cancel(a) => transition("task cancel", store, root, a, TaskStatus::Cancelled),
+        TaskCmd::SetStatus { act, status } => {
+            let label = "task set-status";
+            match TaskStatus::parse(&status) {
+                Ok(to) => transition(label, store, root, act, to),
+                Err(e) => Envelope::err(label, "INVALID_STATUS", e.to_string()).emit(),
+            }
         }
 
         TaskCmd::SetReview {
