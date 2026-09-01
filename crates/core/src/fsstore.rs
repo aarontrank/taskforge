@@ -171,7 +171,13 @@ impl FsStore {
     fn render(task: &Task) -> String {
         let yaml = serde_yaml::to_string(task).unwrap_or_default();
         let description = task.description.clone().unwrap_or_default();
-        format!("{FENCE}\n{yaml}{FENCE}\n\n## Summary\n\n{description}\n\n## Notes\n\n")
+        // Summary / Acceptance Criteria / Notes, matching the template this replaced. The
+        // middle heading is where a task records what "done" looks like, so a checklist has
+        // somewhere to live without the writer inventing a structure.
+        format!(
+            "{FENCE}\n{yaml}{FENCE}\n\n## Summary\n\n{description}\n\n\
+             ## Acceptance Criteria\n\n- [ ] \n\n## Notes\n\n"
+        )
     }
 }
 
@@ -364,5 +370,22 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn the_task_body_keeps_a_place_for_acceptance_criteria() {
+        // The pre-Rust template had Summary / Acceptance Criteria / Notes. Dropping the middle
+        // heading in the port lost the one place a task says what "done" would look like, which
+        // is a first-class section in an orchestrate per-stream file.
+        let (d, mut s) = root();
+        s.put(task("TASK-0001"));
+        let text =
+            std::fs::read_to_string(d.path().join("workspaces/main/tasks/TASK-0001/task.md"))
+                .unwrap();
+        let headings: Vec<&str> = text.lines().filter(|l| l.starts_with("## ")).collect();
+        assert_eq!(
+            headings,
+            vec!["## Summary", "## Acceptance Criteria", "## Notes"]
+        );
     }
 }
