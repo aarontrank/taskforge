@@ -242,11 +242,18 @@ The Rust implementation is the only implementation; the earlier TypeScript versi
 Next.js web UI have been removed. Human inspection is the markdown files themselves plus
 `taskforge task list`.
 
-`116` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
+`122` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
 guards, filesystem round-trips, hook execution including timeouts, and the CLI end to end —
 including a test that every one of the eleven statuses is reachable through the binary, and
 tests that drive the write path against an unwritable file so a refused write cannot regress
 into being reported as a success.
+
+Six of them check the **skill docs** rather than the code (`crates/cli/tests/docs.rs`). An agent
+learns this tool by reading `skill/taskforge/`, so a wrong claim there misleads it exactly as a
+bug would, and silently. The transition table in `reference.md` is parsed and diffed against
+`can_transition`; every documented flag is checked against that command's `--help`; every
+runnable example is executed; every error and warning code the CLI emits must appear in the
+reference. The rule: no factual claim about the CLI is verified by reading it.
 
 ## Licence
 
