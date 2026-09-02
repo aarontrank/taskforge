@@ -58,17 +58,48 @@ taskforge task create --title "Port the CLI"   --owner agent --actor aaron --par
 taskforge task tree --id "$parent" --json
 ```
 
-One level of nesting only. For ordering between subtasks use `add-blocker`, which is enforced
+One level of nesting only, and enforced: `--parent` on a task that is already a subtask is
+refused with `INVALID_PARENT`. For ordering between subtasks use `add-blocker`, which is enforced
 at `start` rather than merely advisory.
 
 ## Concurrency
 
-When more than one agent may touch a task, pass the version you read:
+When more than one agent may touch a task, pass the version you read. This works on **every**
+mutating command — the status transitions and the field setters alike:
 
 ```bash
 v=$(taskforge task show --id TASK-0001 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["version"])')
-taskforge task start --id TASK-0001 --actor agent --version "$v" --json
+taskforge task start      --id TASK-0001 --actor agent --version "$v" --json
+taskforge task set-worker --id TASK-0001 --worker w1 --actor agent --version "$v" --json
 ```
 
 On `CONFLICT_VERSION_MISMATCH`, re-read and decide whether the action still applies. Do not
 retry blindly in a loop.
+
+## Abandoning work in flight
+
+`cancel` is refused from `running` and `in-review`. Dropping live work is two steps:
+
+```bash
+taskforge task add-comment --id TASK-0001 --actor aaron --text "Premise changed; dropping." --json
+taskforge task block       --id TASK-0001 --actor aaron --json   # -> stuck
+taskforge task cancel      --id TASK-0001 --actor aaron --json   # -> cancelled
+```
+
+## When a command succeeds but warns
+
+`ok: true` with a non-empty `warnings` means the mutation is stored and something after it was
+not:
+
+```bash
+taskforge task start --id TASK-0001 --actor agent --json
+# ok: true, status: running, warnings: [{ code: "HOOK_FAILED", ... }]
+```
+
+Do not retry the command — that would double-apply it. The task moved. Report the warning:
+`HOOK_FAILED` means a notification never went out, so whoever was supposed to hear about this
+did not. `AUDIT_WRITE_FAILED` means the trail is incomplete. Neither is fixed by repeating the
+mutation.
+
+An `IO_ERROR` is the opposite case: the write failed, nothing is stored, and retrying is exactly
+right once the cause (a full disk, a read-only mount, a permissions problem) is dealt with.

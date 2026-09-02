@@ -23,6 +23,33 @@ as `error: CODE: message`. Never parse that form — it is for people.
 
 On failure `ok` is `false`, `data` is `null`, and `errors[0]` carries `{ code, message }`.
 
+`warnings` uses the same `{ code, message }` shape and appears on **successful** responses. It
+reports what went wrong *after* the mutation committed, which cannot fail the command without
+denying a change that really happened. Some entries add a `detail` object with structured
+context. Currently emitted:
+
+| Warning code | Meaning | `detail` |
+|---|---|---|
+| `HOOK_FAILED` | A hook exited non-zero, timed out, or could not be started | `hook_id`, `exit_code`, `timed_out`, `started` |
+| `AUDIT_WRITE_FAILED` | The change is stored; its `audit.log` line is not | — |
+| `RECURRENCE_WRITE_FAILED` | A recurring task completed; its successor was not created | — |
+
+```json
+{
+  "ok": true,
+  "command": "task start",
+  "data": { "status": "running" },
+  "warnings": [
+    {
+      "code": "HOOK_FAILED",
+      "message": "hook \"notify\" timed out",
+      "detail": { "hook_id": "notify", "exit_code": -1, "timed_out": true, "started": true }
+    }
+  ],
+  "errors": []
+}
+```
+
 ## Setup
 
 ```bash
@@ -47,7 +74,7 @@ taskforge task show   --id TASK-0001 --json
 taskforge task list   --json [--status <status>] [--archived]
 taskforge task search --text "storage" --json      # matches title and description
 taskforge task tree   --id TASK-0001 --json        # task plus its subtasks
-taskforge task audit  --id TASK-0001 --json        # full mutation history
+taskforge task audit  --id TASK-0001 --json        # mutation history: creation, status changes, field patches
 ```
 
 `--parent` makes a subtask. One level of nesting only. `task list` hides archived and
@@ -57,20 +84,28 @@ soft-deleted tasks unless `--archived` is passed.
 
 Each takes `--id`, `--actor`, optional `--version <n>` for optimistic concurrency.
 
-| Command | Moves | Notes |
+| Command | Legal from | Notes |
 |---|---|---|
-| `task start` | open/pending/changes-requested/stuck/failed → running | Refuses while any blocker is not `done` |
-| `task request-review` | running → in-review | For `review_required` work |
-| `task reject` | in-review → changes-requested | Feedback landed |
-| `task merge` | in-review → merged | **Not** terminal |
-| `task accept` | merged → done | Human acceptance; the only success terminal |
-| `task complete` | running → done | Fails with `REVIEW_REQUIRED` if review was demanded |
-| `task pending` | open/stuck → pending | Planned into a wave, not yet dispatched |
-| `task wait` | running → waiting-on-schedule | Slow non-review step, still on schedule |
-| `task block` | → stuck | Needs a decision, or a wait passed its `expected_by` |
-| `task fail` | → failed | Attempted and failed. `task start` retries it |
-| `task cancel` | → cancelled | Will never run, e.g. a dependency failed permanently |
+| `task start` | open, pending, changes-requested, waiting-on-schedule, stuck, failed | → running. Refuses while any blocker is not `done` |
+| `task request-review` | running, waiting-on-schedule, stuck | → in-review |
+| `task reject` | in-review | → changes-requested. Feedback landed |
+| `task merge` | in-review | → merged. **Not** terminal |
+| `task accept` | merged, running | → done. Human acceptance; the only success terminal. From `running` only when no review was demanded |
+| `task complete` | running, merged | → done. Fails with `REVIEW_REQUIRED` if review was demanded and the task never went through it |
+| `task pending` | open, stuck | → pending. Planned into a wave, not yet dispatched |
+| `task wait` | running, stuck | → waiting-on-schedule. Slow non-review step, still on schedule |
+| `task block` | every state except open, done, cancelled | → stuck. Needs a decision, or a wait passed its `expected_by` |
+| `task fail` | running, in-review, changes-requested, merged, waiting-on-schedule, stuck | → failed. `task start` retries it |
+| `task cancel` | **open, pending, stuck, failed only** | → cancelled. In-flight work must be `block`ed first — see below |
 | `task set-status --status <name>` | any legal move | Shorthand for the above; same guard |
+
+**`cancel` cannot abandon in-flight work directly.** It is refused from `running`, `in-review`,
+`changes-requested`, `waiting-on-schedule`, and `merged` with `INVALID_STATUS_TRANSITION`. To
+drop a live task: `task block` (→ `stuck`), then `task cancel`. This is deliberate — walking away
+from work someone may already be reviewing takes two decisions, not one.
+
+`done` and `cancelled` are immutable: no transition leaves either. `failed` is terminal in the
+sense that no worker holds it, but `start` still retries it.
 
 ```bash
 taskforge task start      --id TASK-0001 --actor agent --version 3 --json
@@ -115,6 +150,18 @@ taskforge task soft-delete          --id TASK-0001 --actor aaron --json
 ```
 
 `--value` on `set-review-required` takes an explicit `true` or `false`.
+
+**Every command here also takes `--version <n>`,** the same optimistic-concurrency guard the
+status transitions use. Pass the version you read and a racing writer is refused with
+`CONFLICT_VERSION_MISMATCH` instead of being silently clobbered. It is optional: omit it and the
+patch applies unguarded.
+
+```bash
+taskforge task set-worker --id TASK-0001 --worker w1 --actor agent --version 7 --json
+```
+
+Every one of them records an audit entry naming `--actor` and the action — `set_title`,
+`assign`, `add_blocker`, `archive`, and so on.
 
 `archive` and `soft-delete` set flags; they do **not** change `status`. An archived task keeps
 whatever status it had.
@@ -162,13 +209,19 @@ date), `relative` (advance from completion time). Month arithmetic clamps to the
 | `ALREADY_ARCHIVED` | Task is already archived |
 | `ATTACHMENT_NOT_FOUND` / `ARTIFACT_NOT_FOUND` | Source file does not exist |
 | `INVALID_STATUS` | Unrecognized `--status` filter value |
+| `INVALID_PARENT` | `--parent` names a task that is already a subtask; one level only |
 | `OWNER_EXISTS` | Owner name already registered |
-| `IO_ERROR` | Filesystem failure; message carries detail |
+| `IO_ERROR` | A write failed. **Nothing was stored** — the task is unchanged on disk, and any status or version in the response would have been a fiction, so none is returned |
 
 ## Hooks
 
 Configured in `<root>/config.json`, fired **after** a mutation commits. A hook that fails,
-hangs, or does not exist is reported and never rolls the change back.
+hangs, or does not exist never rolls the change back — hooks are notifications, not gates — and
+is reported as a `HOOK_FAILED` entry in the response's `warnings`, with the hook's id, exit code,
+whether it timed out, and whether it started at all. The command still exits 0.
+
+Check `warnings` on success: a hook that silently never ran is the failure mode this reporting
+exists to prevent.
 
 ```json
 {
@@ -197,4 +250,6 @@ The payload has **no trailing newline**, so a hook appending to an NDJSON log mu
 itself — `sh -c 'cat >> log; echo >> log'` rather than `cat >> log`, or every event lands on a
 single concatenated line.
 
-A hook exceeding `timeout_ms` is killed and reported with `timed_out: true`.
+A hook exceeding `timeout_ms` is killed and reported with `timed_out: true`. A hook whose
+command does not exist or is not executable reports `started: false` — distinct from a hook that
+ran and exited badly, which would otherwise look identical (both carry `exit_code: -1`).

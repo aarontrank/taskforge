@@ -30,8 +30,12 @@ open ─→ pending ─→ running ─→ in-review ─→ merged ─→ done
                       │           │                   ▲
                       │           └→ changes-requested┘
                       ├→ waiting-on-schedule
-                      └→ stuck / failed / cancelled
+                      └→ stuck / failed
 ```
+
+`cancelled` is reachable from `open`, `pending`, `stuck`, and `failed` — not from work already in
+flight. Abandoning a `running` or `in-review` task is `block` then `cancel`, so dropping something
+a reviewer may already be holding takes two decisions.
 
 Eleven states: `open`, `pending`, `running`, `in-review`, `changes-requested`, `merged`,
 `waiting-on-schedule`, `stuck`, `done`, `failed`, `cancelled` — each reachable from the CLI,
@@ -184,14 +188,26 @@ lives in the `orchestrate` skill rather than here, so there is one copy of it.
 ## Concurrency, audit, and hooks
 
 **Optimistic concurrency.** Pass `--version <n>` with the version you read; a stale value fails
-with `CONFLICT_VERSION_MISMATCH` instead of silently overwriting.
+with `CONFLICT_VERSION_MISMATCH` instead of silently overwriting. Available on every mutating
+command — status transitions and field setters alike.
 
-**Audit.** Every mutation appends a line to the task's `audit.log`. Read it with
-`taskforge task audit --id TASK-0001 --json`.
+**Audit.** Every mutation appends a line to the task's `audit.log`, naming the `--actor` that
+caused it and the action: `created`, `status_changed`, `set_review`, `assign`, `archive`, and so
+on. Read it with `taskforge task audit --id TASK-0001 --json`.
+
+**Writes are fallible and say so.** A refused write — full disk, read-only mount, bad permissions
+— fails the command with `IO_ERROR` and stores nothing. The CLI never reports a status or version
+it did not persist.
 
 **Hooks.** Local commands fired *after* a mutation commits, configured in `config.json`, with
-the event payload on stdin. A hook that fails, hangs, or does not exist is reported and never
-rolls the change back — hooks are notifications, not gates. Details in the skill reference.
+the event payload on stdin. A hook that fails, hangs, or does not exist never rolls the change
+back — hooks are notifications, not gates — and is reported as a `HOOK_FAILED` entry in the
+response's `warnings` while the command still exits 0. Details in the skill reference.
+
+**`warnings` on a successful response.** Anything that went wrong after the change committed
+lands here rather than failing the command: a hook that never fired, an audit line that could not
+be written, a recurring successor that could not be created. `ok: true` means the mutation
+happened, not that nothing went wrong.
 
 ---
 
@@ -226,9 +242,11 @@ The Rust implementation is the only implementation; the earlier TypeScript versi
 Next.js web UI have been removed. Human inspection is the markdown files themselves plus
 `taskforge task list`.
 
-`87` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
+`116` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
 guards, filesystem round-trips, hook execution including timeouts, and the CLI end to end —
-including a test that every one of the eleven statuses is reachable through the binary.
+including a test that every one of the eleven statuses is reachable through the binary, and
+tests that drive the write path against an unwritable file so a refused write cannot regress
+into being reported as a success.
 
 ## Licence
 

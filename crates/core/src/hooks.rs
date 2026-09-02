@@ -35,6 +35,10 @@ pub struct HookResult {
     pub ok: bool,
     pub exit_code: i32,
     pub timed_out: bool,
+    /// Whether the process was launched at all. A missing binary and a hook that exited with an
+    /// unknown code both report `exit_code: -1`, so without this a configuration error is
+    /// indistinguishable from a hook that ran and misbehaved.
+    pub started: bool,
 }
 
 /// Runs configured hooks after a mutation has already been committed.
@@ -86,6 +90,7 @@ impl HookEngine {
             ok: false,
             exit_code: -1,
             timed_out: false,
+            started: false,
         };
 
         let spawned = Command::new(&h.command)
@@ -98,9 +103,10 @@ impl HookEngine {
         let mut child = match spawned {
             Ok(c) => c,
             // A missing or unexecutable command is a configuration error, reported like any
-            // other hook failure.
+            // other hook failure — but flagged as never-started so it reads as one.
             Err(_) => return result,
         };
+        result.started = true;
 
         if let Some(stdin) = child.stdin.take() {
             let mut stdin = stdin;
@@ -242,5 +248,27 @@ mod tests {
         )]);
         let r = engine.fire("task.created", "main", "TASK-0001", "open");
         assert!(!r[0].ok);
+    }
+
+    #[test]
+    fn a_command_that_does_not_exist_is_distinguishable_from_one_that_failed() {
+        // Both report exit_code -1, so without this flag a missing binary is described as
+        // "exited -1" — which reads as a hook that ran and returned a strange code.
+        let engine = HookEngine::new(vec![
+            hook("nope", "task.created", "definitely-not-a-cmd-xyz", vec![]),
+            hook("ran", "task.created", "false", vec![]),
+        ]);
+        let r = engine.fire("task.created", "main", "TASK-0001", "open");
+        assert!(!r[0].started, "the missing binary never started");
+        assert!(r[1].started, "the failing hook did start");
+    }
+
+    #[test]
+    fn a_timed_out_hook_counts_as_started() {
+        let mut h = hook("slow", "task.created", "sleep", vec!["30"]);
+        h.timeout_ms = 200;
+        let engine = HookEngine::new(vec![h]);
+        let r = engine.fire("task.created", "main", "TASK-0001", "open");
+        assert!(r[0].started, "it ran, it just did not finish in time");
     }
 }

@@ -14,3 +14,6 @@
 
 # Rust
 /target
+
+# Investigation notebook
+.investigations/

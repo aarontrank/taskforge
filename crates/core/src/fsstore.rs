@@ -7,8 +7,9 @@ use std::path::PathBuf;
 /// Filesystem-backed store: one folder per task, plain text throughout.
 ///
 /// Reads are fallible in principle but modelled as `Option` on the `TaskStore` trait, because
-/// the domain layer only ever needs "is it there". Layout-level operations that a caller must
-/// be told about — init, counter allocation, log appends — return `io::Result` instead.
+/// the domain layer only ever needs "is it there". Every write returns `io::Result` — task
+/// writes, init, counter allocation, and log appends alike — so a caller can never mistake a
+/// refused write for a successful one.
 pub struct FsStore {
     root: PathBuf,
     workspace: String,
@@ -168,16 +169,21 @@ impl FsStore {
     }
 
     /// Render `task.md`: frontmatter fence, then the human-facing body.
-    fn render(task: &Task) -> String {
-        let yaml = serde_yaml::to_string(task).unwrap_or_default();
+    ///
+    /// Fallible because an empty-frontmatter fallback would be worse than an error: `get`
+    /// reads a task with no frontmatter as absent, so a serialization failure would make the
+    /// task disappear instead of reporting itself.
+    fn render(task: &Task) -> std::io::Result<String> {
+        let yaml = serde_yaml::to_string(task)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let description = task.description.clone().unwrap_or_default();
         // Summary / Acceptance Criteria / Notes, matching the template this replaced. The
         // middle heading is where a task records what "done" looks like, so a checklist has
         // somewhere to live without the writer inventing a structure.
-        format!(
+        Ok(format!(
             "{FENCE}\n{yaml}{FENCE}\n\n## Summary\n\n{description}\n\n\
              ## Acceptance Criteria\n\n- [ ] \n\n## Notes\n\n"
-        )
+        ))
     }
 }
 
@@ -190,18 +196,23 @@ impl TaskStore for FsStore {
         serde_yaml::from_str(&rest[..end]).ok()
     }
 
-    fn put(&mut self, task: Task) {
+    /// Write `task.md`, creating the task folder if it is new.
+    ///
+    /// Every failure is propagated. Swallowing them made a full disk or a read-only mount
+    /// indistinguishable from a successful mutation, so the CLI reported a status and version
+    /// that were never stored.
+    fn put(&mut self, task: Task) -> std::io::Result<()> {
         let dir = self.task_dir(&task.id);
         for sub in ["attachments", "artifacts", "subtasks"] {
-            let _ = fs::create_dir_all(dir.join(sub));
+            fs::create_dir_all(dir.join(sub))?;
         }
-        let _ = fs::write(dir.join("task.md"), Self::render(&task));
+        fs::write(dir.join("task.md"), Self::render(&task)?)
     }
 
-    fn append_audit(&mut self, entry: AuditEntry) {
-        if let Ok(line) = serde_json::to_string(&entry) {
-            let _ = self.append_line(&entry.task_id.clone(), "audit.log", &line);
-        }
+    fn append_audit(&mut self, entry: AuditEntry) -> std::io::Result<()> {
+        let line = serde_json::to_string(&entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.append_line(&entry.task_id.clone(), "audit.log", &line)
     }
 
     fn allocate_id(&mut self) -> String {
@@ -244,7 +255,7 @@ mod tests {
         t.expected_by = Some("2026-09-03T00:00:00Z".into());
         t.worker = Some("w1".into());
         t.blocked_by = vec!["TASK-0002".into()];
-        s.put(t.clone());
+        s.put(t.clone()).unwrap();
 
         let back = s.get("TASK-0001").expect("task should be readable");
         assert_eq!(back, t, "round-trip must preserve every field");
@@ -259,7 +270,7 @@ mod tests {
     #[test]
     fn the_task_lives_in_the_documented_folder_layout() {
         let (d, mut s) = root();
-        s.put(task("TASK-0001"));
+        s.put(task("TASK-0001")).unwrap();
         let dir = d.path().join("workspaces/main/tasks/TASK-0001");
         assert!(dir.join("task.md").is_file(), "task.md");
         assert!(dir.join("attachments").is_dir(), "attachments/");
@@ -272,7 +283,7 @@ mod tests {
         let (d, mut s) = root();
         let mut t = task("TASK-0001");
         t.description = Some("Why this matters".into());
-        s.put(t);
+        s.put(t).unwrap();
         let text =
             std::fs::read_to_string(d.path().join("workspaces/main/tasks/TASK-0001/task.md"))
                 .unwrap();
@@ -289,7 +300,7 @@ mod tests {
     #[test]
     fn the_audit_log_is_append_only_newline_delimited_json() {
         let (d, mut s) = root();
-        s.put(task("TASK-0001"));
+        s.put(task("TASK-0001")).unwrap();
         for n in 1..=2 {
             s.append_audit(AuditEntry {
                 ts: format!("2026-09-0{n}T00:00:00Z"),
@@ -298,7 +309,8 @@ mod tests {
                 task_id: "TASK-0001".into(),
                 from: None,
                 to: Some("running".into()),
-            });
+            })
+            .unwrap();
         }
         let text =
             std::fs::read_to_string(d.path().join("workspaces/main/tasks/TASK-0001/audit.log"))
@@ -323,7 +335,7 @@ mod tests {
     #[test]
     fn worklogs_and_comments_append_under_their_own_headings() {
         let (d, mut s) = root();
-        s.put(task("TASK-0001"));
+        s.put(task("TASK-0001")).unwrap();
         s.append_worklog("TASK-0001", "aaron", "2026-09-01T00:00:00Z", "did a thing")
             .unwrap();
         s.append_comment("TASK-0001", "kiro", "2026-09-01T00:01:00Z", "a question")
@@ -339,7 +351,7 @@ mod tests {
     #[test]
     fn a_task_file_with_no_frontmatter_fence_reads_as_none() {
         let (d, mut s) = root();
-        s.put(task("TASK-0001"));
+        s.put(task("TASK-0001")).unwrap();
         let f = d.path().join("workspaces/main/tasks/TASK-0001/task.md");
         std::fs::write(&f, "just a body, no fence\n").unwrap();
         assert!(
@@ -351,7 +363,7 @@ mod tests {
     #[test]
     fn a_task_file_with_unparseable_frontmatter_reads_as_none() {
         let (d, mut s) = root();
-        s.put(task("TASK-0001"));
+        s.put(task("TASK-0001")).unwrap();
         let f = d.path().join("workspaces/main/tasks/TASK-0001/task.md");
         std::fs::write(&f, "---\nid: [unclosed\n---\n\nbody\n").unwrap();
         assert!(s.get("TASK-0001").is_none());
@@ -360,7 +372,7 @@ mod tests {
     #[test]
     fn attaching_a_missing_source_file_is_an_error() {
         let (_d, mut s) = root();
-        s.put(task("TASK-0001"));
+        s.put(task("TASK-0001")).unwrap();
         let err = s
             .attach(
                 "TASK-0001",
@@ -372,13 +384,64 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
+    /// A write that the filesystem refuses must surface as an error, not vanish.
+    ///
+    /// Unix-only because it works by removing write permission; there is no portable way to
+    /// simulate a full disk, and this is the failure mode that actually reaches users.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_to_an_unwritable_task_file_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, mut s) = root();
+        s.put(task("TASK-0001")).expect("the first write succeeds");
+
+        let f = s.task_dir("TASK-0001").join("task.md");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let mut t = task("TASK-0001");
+        t.status = TaskStatus::Running;
+        let err = s.put(t).expect_err("a refused write is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            s.get("TASK-0001").unwrap().status,
+            TaskStatus::Open,
+            "and the stored task is unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_audit_append_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, mut s) = root();
+        s.put(task("TASK-0001")).unwrap();
+        let dir = s.task_dir("TASK-0001");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = s
+            .append_audit(AuditEntry {
+                ts: "2026-09-01T00:00:00Z".into(),
+                actor: "aaron".into(),
+                action: "status_changed".into(),
+                task_id: "TASK-0001".into(),
+                from: None,
+                to: Some("running".into()),
+            })
+            .expect_err("an audit append that cannot happen is an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[test]
     fn the_task_body_keeps_a_place_for_acceptance_criteria() {
         // The pre-Rust template had Summary / Acceptance Criteria / Notes. Dropping the middle
         // heading in the port lost the one place a task says what "done" would look like, which
         // is a first-class section in an orchestrate per-stream file.
         let (d, mut s) = root();
-        s.put(task("TASK-0001"));
+        s.put(task("TASK-0001")).unwrap();
         let text =
             std::fs::read_to_string(d.path().join("workspaces/main/tasks/TASK-0001/task.md"))
                 .unwrap();

@@ -24,6 +24,8 @@ pub enum TaskError {
         expected: i64,
         actual: i64,
     },
+    #[error("could not write {id}: {source}")]
+    Io { id: String, source: std::io::Error },
 }
 
 impl TaskError {
@@ -36,8 +38,20 @@ impl TaskError {
             TaskError::Blocked { .. } => "BLOCKED_BY_OPEN_TASK",
             TaskError::ReviewRequired(_) => "REVIEW_REQUIRED",
             TaskError::VersionMismatch { .. } => "CONFLICT_VERSION_MISMATCH",
+            TaskError::Io { .. } => "IO_ERROR",
         }
     }
+}
+
+/// A problem that happened *after* a mutation was already committed.
+///
+/// It cannot be an error — the change is real and the caller must be told it happened — but it
+/// must not be silent either, or an agent believes a notification fired or an audit entry
+/// landed when neither did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    pub code: &'static str,
+    pub message: String,
 }
 
 /// Workflow operations over a store.
@@ -53,8 +67,11 @@ pub struct TaskService<S: TaskStore> {
     /// Hooks to announce committed mutations to. `None` means none are configured, which is
     /// the common case and must stay free of cost.
     hooks: Option<HookEngine>,
-    /// Outcome of the hooks fired by the most recent mutation, for `hooks.log` and reporting.
+    /// Outcome of the hooks fired by the most recent mutation. The CLI turns any failure among
+    /// these into an envelope warning.
     pub last_hook_results: Vec<HookResult>,
+    /// Post-commit problems from the most recent mutation, for the caller to report.
+    pub last_warnings: Vec<Warning>,
 }
 
 impl<S: TaskStore> TaskService<S> {
@@ -65,6 +82,7 @@ impl<S: TaskStore> TaskService<S> {
             last_generated: None,
             hooks: None,
             last_hook_results: Vec::new(),
+            last_warnings: Vec::new(),
         }
     }
 
@@ -143,19 +161,31 @@ impl<S: TaskStore> TaskService<S> {
             _ => {}
         }
 
-        self.store.put(task.clone());
-        self.store.append_audit(AuditEntry {
+        self.last_warnings.clear();
+
+        // The one write whose failure is fatal: until this lands, nothing has happened, and
+        // reporting success would hand the caller a status that is not stored.
+        self.store.put(task.clone()).map_err(|e| TaskError::Io {
+            id: id.to_string(),
+            source: e,
+        })?;
+
+        // Everything below runs after the change is committed, so no failure here can un-commit
+        // it. Each is therefore a warning: real, reported, and not an error.
+        if let Err(e) = self.store.append_audit(AuditEntry {
             ts: self.now.clone(),
             actor: actor.to_string(),
             action: "status_changed".to_string(),
             task_id: id.to_string(),
             from: Some(from.to_string()),
             to: Some(to.to_string()),
-        });
+        }) {
+            self.last_warnings.push(Warning {
+                code: "AUDIT_WRITE_FAILED",
+                message: format!("{id} moved to {to} but the audit entry was not written: {e}"),
+            });
+        }
 
-        // The mutation is committed, so it can now be announced. Deliberately after the
-        // write and the audit entry: a hook that fails, hangs, or does not exist must not be
-        // able to undo what already happened.
         self.last_hook_results = match &self.hooks {
             Some(engine) => engine.fire("task.status_changed", &task.workspace, id, to.as_str()),
             None => Vec::new(),
@@ -166,15 +196,30 @@ impl<S: TaskStore> TaskService<S> {
         self.last_generated = None;
         if to == TaskStatus::Done {
             if let Some(rec) = task.recurrence.clone() {
-                let next = self.generate_next_occurrence(&task, &rec, actor);
-                self.last_generated = Some(next);
+                match self.generate_next_occurrence(&task, &rec, actor) {
+                    Ok(next) => self.last_generated = Some(next),
+                    Err(e) => self.last_warnings.push(Warning {
+                        code: "RECURRENCE_WRITE_FAILED",
+                        message: format!(
+                            "{id} completed but its next occurrence was not created: {e}"
+                        ),
+                    }),
+                }
             }
         }
         Ok(task)
     }
 
     /// Create the follow-on occurrence of a completed recurring task.
-    fn generate_next_occurrence(&mut self, prior: &Task, rec: &Recurrence, actor: &str) -> String {
+    ///
+    /// Fallible so a failure to store the successor is reported rather than announced as an id
+    /// that was never written.
+    fn generate_next_occurrence(
+        &mut self,
+        prior: &Task,
+        rec: &Recurrence,
+        actor: &str,
+    ) -> std::io::Result<String> {
         let id = self.store.allocate_id();
         let mut next = Task::new(
             &id,
@@ -199,7 +244,7 @@ impl<S: TaskStore> TaskService<S> {
         next.recurrence = Some(rec.clone());
         next.due_at = self.next_due(prior, rec);
 
-        self.store.put(next);
+        self.store.put(next)?;
         self.store.append_audit(AuditEntry {
             ts: self.now.clone(),
             actor: actor.to_string(),
@@ -207,8 +252,8 @@ impl<S: TaskStore> TaskService<S> {
             task_id: id.clone(),
             from: Some(prior.id.clone()),
             to: None,
-        });
-        id
+        })?;
+        Ok(id)
     }
 
     /// Due date for the next occurrence, per the configured strategy.
@@ -282,10 +327,10 @@ mod tests {
     #[test]
     fn start_refuses_while_a_blocker_is_unresolved() {
         let mut s = svc();
-        s.store.put(task("TASK-0002"));
+        s.store.put(task("TASK-0002")).unwrap();
         let mut t = task("TASK-0001");
         t.blocked_by = vec!["TASK-0002".into()];
-        s.store.put(t);
+        s.store.put(t).unwrap();
 
         let err = s
             .set_status("TASK-0001", TaskStatus::Running, "agent", None)
@@ -302,10 +347,10 @@ mod tests {
         let mut s = svc();
         let mut b = task("TASK-0002");
         b.status = TaskStatus::Done;
-        s.store.put(b);
+        s.store.put(b).unwrap();
         let mut t = task("TASK-0001");
         t.blocked_by = vec!["TASK-0002".into()];
-        s.store.put(t);
+        s.store.put(t).unwrap();
 
         let out = s
             .set_status("TASK-0001", TaskStatus::Running, "agent", None)
@@ -322,10 +367,10 @@ mod tests {
         let mut s = svc();
         let mut b = task("TASK-0002");
         b.status = TaskStatus::Merged;
-        s.store.put(b);
+        s.store.put(b).unwrap();
         let mut t = task("TASK-0001");
         t.blocked_by = vec!["TASK-0002".into()];
-        s.store.put(t);
+        s.store.put(t).unwrap();
 
         let err = s
             .set_status("TASK-0001", TaskStatus::Running, "agent", None)
@@ -336,7 +381,7 @@ mod tests {
     #[test]
     fn an_illegal_transition_is_rejected_by_code() {
         let mut s = svc();
-        s.store.put(task("TASK-0001")); // Open
+        s.store.put(task("TASK-0001")).unwrap(); // Open
         let err = s
             .set_status("TASK-0001", TaskStatus::Merged, "agent", None)
             .unwrap_err();
@@ -349,7 +394,7 @@ mod tests {
         let mut t = task("TASK-0001");
         t.status = TaskStatus::Running;
         t.review_required = true;
-        s.store.put(t);
+        s.store.put(t).unwrap();
 
         let err = s
             .set_status("TASK-0001", TaskStatus::Done, "agent", None)
@@ -360,7 +405,7 @@ mod tests {
     #[test]
     fn a_stale_version_is_a_conflict() {
         let mut s = svc();
-        s.store.put(task("TASK-0001")); // version 1
+        s.store.put(task("TASK-0001")).unwrap(); // version 1
         let err = s
             .set_status("TASK-0001", TaskStatus::Running, "agent", Some(99))
             .unwrap_err();
@@ -370,7 +415,7 @@ mod tests {
     #[test]
     fn the_matching_version_is_accepted() {
         let mut s = svc();
-        s.store.put(task("TASK-0001"));
+        s.store.put(task("TASK-0001")).unwrap();
         assert!(s
             .set_status("TASK-0001", TaskStatus::Running, "agent", Some(1))
             .is_ok());
@@ -390,7 +435,7 @@ mod tests {
         let mut s = svc();
         let mut t = task("TASK-0001");
         t.status = TaskStatus::Running;
-        s.store.put(t);
+        s.store.put(t).unwrap();
         let out = s
             .set_status("TASK-0001", TaskStatus::Done, "agent", None)
             .unwrap();
@@ -403,7 +448,7 @@ mod tests {
         let mut t = task("TASK-0001");
         t.status = TaskStatus::Running;
         t.review_required = true;
-        s.store.put(t);
+        s.store.put(t).unwrap();
         let out = s
             .set_status("TASK-0001", TaskStatus::InReview, "agent", None)
             .unwrap();
@@ -416,7 +461,7 @@ mod tests {
     #[test]
     fn every_mutation_appends_one_audit_entry() {
         let mut s = svc();
-        s.store.put(task("TASK-0001"));
+        s.store.put(task("TASK-0001")).unwrap();
         s.set_status("TASK-0001", TaskStatus::Running, "aaron", None)
             .unwrap();
         let log = s.store.audit_of("TASK-0001");
@@ -455,7 +500,7 @@ mod tests {
             DueStrategy::None,
         );
         t.description = Some("water the plants".into());
-        s.store.put(t);
+        s.store.put(t).unwrap();
 
         let done = s
             .set_status("TASK-0001", TaskStatus::Done, "aaron", None)
@@ -494,7 +539,7 @@ mod tests {
         let mut s = svc();
         let mut t = task("TASK-0001");
         t.status = TaskStatus::Running;
-        s.store.put(t);
+        s.store.put(t).unwrap();
         s.set_status("TASK-0001", TaskStatus::Done, "aaron", None)
             .unwrap();
         assert!(s.last_generated.is_none());
@@ -515,7 +560,7 @@ mod tests {
             r.carry_forward_description = false;
             r.preserve_review_required = false;
         }
-        s.store.put(t);
+        s.store.put(t).unwrap();
 
         // review_required means Done is only reachable via review, so walk the real path
         // rather than asserting against a shortcut the service correctly refuses.
@@ -530,12 +575,14 @@ mod tests {
     #[test]
     fn due_strategy_none_leaves_the_next_occurrence_undated() {
         let mut s = svc();
-        s.store.put(recurring(
-            "TASK-0001",
-            RecurrenceFrequency::Daily,
-            Some("2026-09-01T00:00:00Z"),
-            DueStrategy::None,
-        ));
+        s.store
+            .put(recurring(
+                "TASK-0001",
+                RecurrenceFrequency::Daily,
+                Some("2026-09-01T00:00:00Z"),
+                DueStrategy::None,
+            ))
+            .unwrap();
         s.set_status("TASK-0001", TaskStatus::Done, "a", None)
             .unwrap();
         let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
@@ -545,12 +592,14 @@ mod tests {
     #[test]
     fn due_strategy_absolute_advances_from_the_previous_due_date() {
         let mut s = svc();
-        s.store.put(recurring(
-            "TASK-0001",
-            RecurrenceFrequency::Daily,
-            Some("2026-09-01T08:00:00Z"),
-            DueStrategy::Absolute,
-        ));
+        s.store
+            .put(recurring(
+                "TASK-0001",
+                RecurrenceFrequency::Daily,
+                Some("2026-09-01T08:00:00Z"),
+                DueStrategy::Absolute,
+            ))
+            .unwrap();
         s.set_status("TASK-0001", TaskStatus::Done, "a", None)
             .unwrap();
         let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
@@ -561,12 +610,14 @@ mod tests {
     fn due_strategy_relative_advances_from_completion_time() {
         // `now` for this service is 2026-09-02T00:00:00Z.
         let mut s = svc();
-        s.store.put(recurring(
-            "TASK-0001",
-            RecurrenceFrequency::Weekly,
-            Some("2026-01-01T00:00:00Z"),
-            DueStrategy::Relative,
-        ));
+        s.store
+            .put(recurring(
+                "TASK-0001",
+                RecurrenceFrequency::Weekly,
+                Some("2026-01-01T00:00:00Z"),
+                DueStrategy::Relative,
+            ))
+            .unwrap();
         s.set_status("TASK-0001", TaskStatus::Done, "a", None)
             .unwrap();
         let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
@@ -592,12 +643,14 @@ mod tests {
             ),
         ] {
             let mut s = svc();
-            s.store.put(recurring(
-                "TASK-0001",
-                freq,
-                Some(due),
-                DueStrategy::Absolute,
-            ));
+            s.store
+                .put(recurring(
+                    "TASK-0001",
+                    freq,
+                    Some(due),
+                    DueStrategy::Absolute,
+                ))
+                .unwrap();
             s.set_status("TASK-0001", TaskStatus::Done, "a", None)
                 .unwrap();
             let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
@@ -610,12 +663,14 @@ mod tests {
         // Jan 31 + 1 month has no equivalent day. JavaScript's setMonth overflows this into
         // March; clamping to the end of February is the deliberate divergence.
         let mut s = svc();
-        s.store.put(recurring(
-            "TASK-0001",
-            RecurrenceFrequency::Monthly,
-            Some("2026-01-31T12:00:00Z"),
-            DueStrategy::Absolute,
-        ));
+        s.store
+            .put(recurring(
+                "TASK-0001",
+                RecurrenceFrequency::Monthly,
+                Some("2026-01-31T12:00:00Z"),
+                DueStrategy::Absolute,
+            ))
+            .unwrap();
         s.set_status("TASK-0001", TaskStatus::Done, "a", None)
             .unwrap();
         let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
@@ -636,7 +691,7 @@ mod tests {
             timeout_ms: 5_000,
         }]);
         let mut s = TaskService::new(MemoryStore::new(), "2026-09-02T00:00:00Z").with_hooks(engine);
-        s.store.put(task("TASK-0001"));
+        s.store.put(task("TASK-0001")).unwrap();
 
         s.set_status("TASK-0001", TaskStatus::Running, "aaron", None)
             .unwrap();
@@ -662,7 +717,7 @@ mod tests {
             timeout_ms: 5_000,
         }]);
         let mut s = TaskService::new(MemoryStore::new(), "2026-09-02T00:00:00Z").with_hooks(engine);
-        s.store.put(task("TASK-0001")); // Open
+        s.store.put(task("TASK-0001")).unwrap(); // Open
 
         // Open -> Merged is illegal, so nothing was committed and nothing should be announced.
         assert!(s
@@ -686,7 +741,7 @@ mod tests {
             timeout_ms: 5_000,
         }]);
         let mut s = TaskService::new(MemoryStore::new(), "2026-09-02T00:00:00Z").with_hooks(engine);
-        s.store.put(task("TASK-0001"));
+        s.store.put(task("TASK-0001")).unwrap();
 
         let out = s.set_status("TASK-0001", TaskStatus::Running, "aaron", None);
         assert!(
@@ -702,9 +757,123 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_task_write_is_reported_rather_than_reported_as_success() {
+        // The defect this covers: `put` used to return `()`, so a full disk or a read-only
+        // mount produced `ok: true` with a bumped version while the file on disk never moved.
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap();
+        s.store.fail_writes_now();
+
+        let err = s
+            .set_status("TASK-0001", TaskStatus::Running, "agent", None)
+            .unwrap_err();
+        assert_eq!(err.code(), "IO_ERROR", "got: {err}");
+    }
+
+    #[test]
+    fn a_failed_task_write_leaves_the_stored_task_untouched() {
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap();
+        s.store.fail_writes_now();
+        let _ = s.set_status("TASK-0001", TaskStatus::Running, "agent", None);
+
+        let on_disk = s.store.get("TASK-0001").expect("still readable");
+        assert_eq!(on_disk.status, TaskStatus::Open, "status did not move");
+        assert_eq!(on_disk.version, 1, "and neither did the version");
+    }
+
+    #[test]
+    fn a_failed_task_write_records_no_audit_entry_and_fires_no_hook() {
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap();
+        s.store.fail_writes_now();
+        let _ = s.set_status("TASK-0001", TaskStatus::Running, "agent", None);
+
+        assert!(
+            s.store.audit_of("TASK-0001").is_empty(),
+            "a change that did not commit is not history"
+        );
+        assert!(
+            s.last_hook_results.is_empty(),
+            "and must not be announced to hooks"
+        );
+    }
+
+    #[test]
+    fn a_failed_audit_append_still_commits_the_mutation() {
+        // Asymmetric on purpose: the task write is the data, so its failure is fatal. The audit
+        // append happens after the change is already committed, so failing it cannot un-commit
+        // anything — reporting failure there would be a lie.
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap();
+        s.store.fail_audit_now();
+
+        let out = s
+            .set_status("TASK-0001", TaskStatus::Running, "agent", None)
+            .expect("the mutation stands");
+        assert_eq!(out.status, TaskStatus::Running);
+        assert_eq!(
+            s.store.get("TASK-0001").unwrap().status,
+            TaskStatus::Running,
+            "and is on disk"
+        );
+    }
+
+    #[test]
+    fn a_failed_audit_append_is_reported_as_a_warning() {
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap();
+        s.store.fail_audit_now();
+        s.set_status("TASK-0001", TaskStatus::Running, "agent", None)
+            .unwrap();
+
+        assert_eq!(s.last_warnings.len(), 1, "the lost trail is surfaced");
+        assert_eq!(s.last_warnings[0].code, "AUDIT_WRITE_FAILED");
+    }
+
+    #[test]
+    fn a_successful_mutation_warns_about_nothing() {
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap();
+        s.set_status("TASK-0001", TaskStatus::Running, "agent", None)
+            .unwrap();
+        assert!(s.last_warnings.is_empty());
+    }
+
+    #[test]
+    fn a_failed_successor_write_warns_without_failing_the_completion() {
+        // The completion is committed before the successor is minted, so a write failure there
+        // must not retroactively fail the completion the caller already observed.
+        let mut s = svc();
+        s.store
+            .put(recurring(
+                "TASK-0001",
+                RecurrenceFrequency::Daily,
+                None,
+                DueStrategy::None,
+            ))
+            .unwrap();
+        // Allow the completion's own write, then fail — so only the successor cannot be stored.
+        s.store.fail_writes_after(1);
+
+        let out = s
+            .set_status("TASK-0001", TaskStatus::Done, "agent", None)
+            .expect("the completion stands");
+        assert_eq!(out.status, TaskStatus::Done);
+        assert!(s.last_generated.is_none(), "no successor to report");
+        assert!(
+            s.last_warnings
+                .iter()
+                .any(|w| w.code == "RECURRENCE_WRITE_FAILED"),
+            "but the caller is told one was not created: {:?}",
+            s.last_warnings
+        );
+    }
+
+    #[test]
     fn a_service_without_hooks_configured_still_works() {
         let mut s = svc();
-        s.store.put(task("TASK-0001"));
+        s.store.put(task("TASK-0001")).unwrap();
         assert!(s
             .set_status("TASK-0001", TaskStatus::Running, "a", None)
             .is_ok());
@@ -721,7 +890,7 @@ mod tests {
             DueStrategy::Absolute,
         );
         t.status = TaskStatus::Running;
-        s.store.put(t);
+        s.store.put(t).unwrap();
         s.set_status("TASK-0001", TaskStatus::Done, "a", None)
             .unwrap();
         let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
@@ -734,12 +903,14 @@ mod tests {
     #[test]
     fn a_due_strategy_with_no_prior_due_date_carries_nothing() {
         let mut s = svc();
-        s.store.put(recurring(
-            "TASK-0001",
-            RecurrenceFrequency::Daily,
-            None,
-            DueStrategy::Absolute,
-        ));
+        s.store
+            .put(recurring(
+                "TASK-0001",
+                RecurrenceFrequency::Daily,
+                None,
+                DueStrategy::Absolute,
+            ))
+            .unwrap();
         s.set_status("TASK-0001", TaskStatus::Done, "a", None)
             .unwrap();
         let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
@@ -758,7 +929,7 @@ mod tests {
         if let Some(r) = t.recurrence.as_mut() {
             r.carry_forward_owner = false;
         }
-        s.store.put(t);
+        s.store.put(t).unwrap();
         s.set_status("TASK-0001", TaskStatus::Done, "a", None)
             .unwrap();
         let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();

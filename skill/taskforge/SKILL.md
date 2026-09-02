@@ -14,15 +14,22 @@ You drive tasks through the `taskforge` CLI. Data lives in `~/.taskforge` (overr
 1. **Always pass `--json`.** Every command emits the same envelope: `ok`, `command`,
    `taskforge_version`, `data`, `warnings`, `errors`. Branch on the **exit status**, then read
    `errors[0].code` — never parse prose.
-2. **Read before mutating.** `taskforge task show --id <ID> --json` tells you the status,
+2. **Read `warnings` on success too.** A command can exit 0 and still tell you something went
+   wrong *after* the change committed — a notification hook that never fired, an audit line that
+   could not be written. `ok: true` means the mutation happened, not that nothing went wrong.
+3. **Read before mutating.** `taskforge task show --id <ID> --json` tells you the status,
    `version`, `blocked_by`, and `review_required` you are about to act against.
-3. **Never edit `task.md` by hand.** Use the patch commands. Hand edits bypass the audit log,
+4. **Never edit `task.md` by hand.** Use the patch commands. Hand edits bypass the audit log,
    the version counter, and every guard below.
-4. **Pass `--actor <you>`** on mutations. It is what the audit log records.
-5. **Log your work** with `task add-worklog` after meaningful progress — what was done, what
+5. **Pass `--actor <you>`** on mutations. Every command that accepts it records it in the audit
+   log, against the name of the action — so `task audit` answers who changed what.
+6. **Log your work** with `task add-worklog` after meaningful progress — what was done, what
    remains, what blocked you. Worklogs are execution records; `add-comment` is discussion.
-6. **On `CONFLICT_VERSION_MISMATCH`,** re-read the task and retry only if the action still
-   applies. Something else changed it under you.
+7. **On `CONFLICT_VERSION_MISMATCH`,** re-read the task and retry only if the action still
+   applies. Something else changed it under you. Every mutating command takes `--version`, both
+   the status transitions and the field setters.
+8. **`IO_ERROR` means nothing was stored.** The task is unchanged on disk; whatever you were
+   reporting upward did not happen. Never treat it as a partial success.
 
 ## The status model, and the two rules that matter
 
@@ -31,7 +38,7 @@ open ─→ pending ─→ running ─→ in-review ─→ merged ─→ done
                       │           │                   ▲
                       │           └→ changes-requested┘ (back to running)
                       ├→ waiting-on-schedule
-                      └→ stuck / failed / cancelled
+                      └→ stuck / failed
 ```
 
 - **`merged` is NOT done.** A merged review still awaits human acceptance. Moving to `done`
@@ -46,10 +53,17 @@ Consequences you will hit:
   `task request-review` instead.
 - `in-review` within its `expected_by` window is **waiting, not stuck**. Do not escalate it and
   do not mark it `stuck`. Only a wait that has passed `expected_by` is `stuck`.
+- **In-flight work cannot be cancelled directly.** `cancel` is legal only from `open`,
+  `pending`, `stuck`, and `failed`. To abandon a `running` or `in-review` task, `block` it first
+  (→ `stuck`), then `cancel`. Deliberate: it makes dropping live work a two-step decision.
+- **One level of nesting.** `--parent` on a task that is already a subtask is refused with
+  `INVALID_PARENT`.
 
 Reaching each state: `task start`, `request-review`, `reject`, `merge`, `accept`, `complete`,
 plus `pending`, `wait`, `block`, `fail`, `cancel` — or `task set-status --status <name>` for any
-of them. All are guarded by the transition table.
+of them. All are guarded by the same transition table, `set-status` included, so it is a
+shorthand and not a way around the guards. The full legal-move matrix is in
+[reference.md](reference.md).
 
 Four fields carry the execution state: `review_id` (which review gates this) and `expected_by`
 (when the wait becomes overdue) via `task set-review`; `worker` (who holds it) and `checkout`

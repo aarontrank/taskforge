@@ -1005,3 +1005,544 @@ fn without_json_an_error_goes_to_stderr_with_its_code_and_exits_nonzero() {
     assert!(err.contains("TASK_NOT_FOUND"), "code on stderr:\n{err}");
     assert!(out.is_empty(), "nothing on stdout for a failure:\n{out}");
 }
+
+// ---------------------------------------------------------------------------
+// D1 — a write that fails must not be reported as success.
+// ---------------------------------------------------------------------------
+
+/// Make a task's `task.md` unwritable, run `f`, then restore permissions.
+///
+/// Unix-only: it works by dropping the write bit, which is the closest portable stand-in for
+/// the full disk / read-only mount that produces this failure in the wild.
+#[cfg(unix)]
+fn with_unwritable_task<T>(root: &std::path::Path, id: &str, f: impl FnOnce() -> T) -> T {
+    use std::os::unix::fs::PermissionsExt;
+    let file = root.join("workspaces/main/tasks").join(id).join("task.md");
+    let original = std::fs::metadata(&file).unwrap().permissions();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let out = f();
+    std::fs::set_permissions(&file, original).unwrap();
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn a_transition_whose_write_fails_reports_io_error_and_exits_nonzero() {
+    let d = setup();
+    let id = mk(d.path(), "victim");
+    let (ok, v) = with_unwritable_task(d.path(), &id, || {
+        run(
+            d.path(),
+            &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+        )
+    });
+    assert!(!ok, "a lost write is a failure, not a success: {v}");
+    assert_eq!(v["errors"][0]["code"], "IO_ERROR", "{v}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_transition_whose_write_fails_does_not_report_a_status_it_did_not_store() {
+    let d = setup();
+    let id = mk(d.path(), "victim");
+    with_unwritable_task(d.path(), &id, || {
+        run(
+            d.path(),
+            &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+        )
+    });
+    // The bug was that the CLI announced running/v2 while the file still said open/v1.
+    let (_, shown) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(shown["data"]["status"], "open");
+    assert_eq!(shown["data"]["version"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_patch_whose_write_fails_reports_io_error() {
+    let d = setup();
+    let id = mk(d.path(), "victim");
+    let (ok, v) = with_unwritable_task(d.path(), &id, || {
+        run(
+            d.path(),
+            &[
+                "task",
+                "set-title",
+                "--id",
+                &id,
+                "--title",
+                "new",
+                "--actor",
+                "agent",
+                "--json",
+            ],
+        )
+    });
+    assert!(!ok, "{v}");
+    assert_eq!(v["errors"][0]["code"], "IO_ERROR", "{v}");
+}
+
+// ---------------------------------------------------------------------------
+// D2 — --actor is required on patch commands, so it must reach the audit log.
+// ---------------------------------------------------------------------------
+
+/// Actions recorded in a task's audit log, in order.
+fn audit_actions(root: &std::path::Path, id: &str) -> Vec<String> {
+    let (_, v) = run(root, &["task", "audit", "--id", id, "--json"]);
+    v["data"]
+        .as_array()
+        .expect("audit is a list")
+        .iter()
+        .map(|e| e["action"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn creating_a_task_is_audited_against_its_actor() {
+    let d = setup();
+    let id = mk(d.path(), "audited");
+    let (_, v) = run(d.path(), &["task", "audit", "--id", &id, "--json"]);
+    let entries = v["data"].as_array().expect("audit is a list");
+    assert_eq!(entries.len(), 1, "creation is history too: {v}");
+    assert_eq!(entries[0]["action"], "created");
+    assert_eq!(entries[0]["actor"], "agent");
+}
+
+#[test]
+fn a_field_patch_records_its_action_and_actor_in_the_audit_log() {
+    let d = setup();
+    let id = mk(d.path(), "audited");
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-review",
+            "--id",
+            &id,
+            "--review-id",
+            "CR-1",
+            "--actor",
+            "aaron",
+            "--json",
+        ],
+    );
+    let (_, v) = run(d.path(), &["task", "audit", "--id", &id, "--json"]);
+    let entries = v["data"].as_array().unwrap();
+    let patch = entries
+        .iter()
+        .find(|e| e["action"] == "set_review")
+        .unwrap_or_else(|| panic!("set_review is in the log: {v}"));
+    assert_eq!(patch["actor"], "aaron", "the actor is the one passed");
+}
+
+#[test]
+fn every_patch_command_leaves_its_own_action_in_the_audit_log() {
+    // One task walked through every patch-style setter: the audit log must name each one, so
+    // "who changed this field" is answerable for all of them rather than a subset.
+    let d = setup();
+    let id = mk(d.path(), "audited");
+    let blocker = mk(d.path(), "blocker");
+    run(
+        d.path(),
+        &["owner", "add", "--name", "rev", "--type", "human", "--json"],
+    );
+    let steps: Vec<(&str, Vec<&str>)> = vec![
+        ("set_title", vec!["set-title", "--title", "t2"]),
+        (
+            "set_description",
+            vec!["set-description", "--description", "d"],
+        ),
+        ("assign", vec!["assign", "--owner", "rev"]),
+        ("set_reviewer", vec!["set-reviewer", "--reviewer", "rev"]),
+        (
+            "set_due",
+            vec!["set-due", "--due-at", "2026-12-01T00:00:00Z"],
+        ),
+        (
+            "set_review_required",
+            vec!["set-review-required", "--value", "true"],
+        ),
+        ("set_review", vec!["set-review", "--review-id", "CR-9"]),
+        ("set_worker", vec!["set-worker", "--worker", "w1"]),
+        ("add_blocker", vec!["add-blocker", "--blocked-by", &blocker]),
+        (
+            "remove_blocker",
+            vec!["remove-blocker", "--blocked-by", &blocker],
+        ),
+        (
+            "set_recurrence",
+            vec!["set-recurrence", "--frequency", "weekly"],
+        ),
+        ("clear_recurrence", vec!["clear-recurrence"]),
+        ("archive", vec!["archive"]),
+        ("soft_delete", vec!["soft-delete"]),
+    ];
+    for (_, args) in &steps {
+        let mut argv = vec!["task"];
+        argv.extend(args.iter().copied());
+        argv.extend(["--id", &id, "--actor", "aaron", "--json"]);
+        let (ok, v) = run(d.path(), &argv);
+        assert!(ok, "{argv:?} succeeds: {v}");
+    }
+    let actions = audit_actions(d.path(), &id);
+    for (expected, _) in &steps {
+        assert!(
+            actions.iter().any(|a| a == expected),
+            "{expected:?} missing from audit log {actions:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D3 — patch commands need the same optimistic-concurrency guard as transitions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_patch_with_a_stale_version_is_a_conflict() {
+    let d = setup();
+    let id = mk(d.path(), "contended");
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "set-title",
+            "--id",
+            &id,
+            "--title",
+            "x",
+            "--actor",
+            "aaron",
+            "--version",
+            "99",
+            "--json",
+        ],
+    );
+    assert!(!ok, "{v}");
+    assert_eq!(v["errors"][0]["code"], "CONFLICT_VERSION_MISMATCH", "{v}");
+}
+
+#[test]
+fn a_patch_with_a_stale_version_does_not_write() {
+    let d = setup();
+    let id = mk(d.path(), "contended");
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-title",
+            "--id",
+            &id,
+            "--title",
+            "clobbered",
+            "--actor",
+            "aaron",
+            "--version",
+            "99",
+            "--json",
+        ],
+    );
+    let (_, shown) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(
+        shown["data"]["title"], "contended",
+        "the title is untouched"
+    );
+    assert_eq!(shown["data"]["version"], 1);
+}
+
+#[test]
+fn a_patch_with_the_matching_version_is_accepted() {
+    let d = setup();
+    let id = mk(d.path(), "contended");
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "set-title",
+            "--id",
+            &id,
+            "--title",
+            "fresh",
+            "--actor",
+            "aaron",
+            "--version",
+            "1",
+            "--json",
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["data"]["title"], "fresh");
+    assert_eq!(v["data"]["version"], 2);
+}
+
+#[test]
+fn a_patch_without_a_version_still_works_unguarded() {
+    // The guard is opt-in: omitting --version must not start failing.
+    let d = setup();
+    let id = mk(d.path(), "contended");
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "set-title",
+            "--id",
+            &id,
+            "--title",
+            "fresh",
+            "--actor",
+            "aaron",
+            "--json",
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["data"]["title"], "fresh");
+}
+
+// ---------------------------------------------------------------------------
+// D4 — a hook that fails must be reported, not silently swallowed.
+// ---------------------------------------------------------------------------
+
+/// Install `hooks` into the root's config.json.
+fn write_hooks(root: &std::path::Path, hooks: serde_json::Value) {
+    let cfg = serde_json::json!({"default_workspace": "main", "hooks": hooks});
+    std::fs::write(
+        root.join("config.json"),
+        serde_json::to_string_pretty(&cfg).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_hook_that_exits_nonzero_is_reported_as_a_warning() {
+    let d = setup();
+    let id = mk(d.path(), "hooked");
+    write_hooks(
+        d.path(),
+        serde_json::json!([{
+            "id": "bad", "enabled": true, "event": "task.status_changed",
+            "command": "sh", "args": ["-c", "exit 7"], "timeout_ms": 5000
+        }]),
+    );
+    let (ok, v) = run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+    );
+    assert!(ok, "the mutation still stands: {v}");
+    assert_eq!(v["data"]["status"], "running");
+    let warnings = v["warnings"].as_array().expect("warnings is a list");
+    assert_eq!(warnings.len(), 1, "the failure is surfaced: {v}");
+    assert_eq!(warnings[0]["code"], "HOOK_FAILED");
+    assert_eq!(warnings[0]["detail"]["hook_id"], "bad");
+    assert_eq!(warnings[0]["detail"]["exit_code"], 7);
+    assert_eq!(warnings[0]["detail"]["timed_out"], false);
+    assert_eq!(warnings[0]["detail"]["started"], true);
+}
+
+#[test]
+fn a_hook_that_times_out_is_reported_as_a_timeout() {
+    let d = setup();
+    let id = mk(d.path(), "hooked");
+    write_hooks(
+        d.path(),
+        serde_json::json!([{
+            "id": "slow", "enabled": true, "event": "task.status_changed",
+            "command": "sh", "args": ["-c", "sleep 5"], "timeout_ms": 200
+        }]),
+    );
+    let (ok, v) = run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["warnings"][0]["code"], "HOOK_FAILED", "{v}");
+    assert_eq!(v["warnings"][0]["detail"]["timed_out"], true, "{v}");
+}
+
+#[test]
+fn a_hook_naming_a_missing_binary_is_reported() {
+    let d = setup();
+    let id = mk(d.path(), "hooked");
+    write_hooks(
+        d.path(),
+        serde_json::json!([{
+            "id": "gone", "enabled": true, "event": "task.status_changed",
+            "command": "definitely-not-a-real-binary-xyz", "args": [], "timeout_ms": 1000
+        }]),
+    );
+    let (ok, v) = run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["warnings"][0]["code"], "HOOK_FAILED", "{v}");
+    assert_eq!(v["warnings"][0]["detail"]["hook_id"], "gone");
+    assert_eq!(
+        v["warnings"][0]["detail"]["started"], false,
+        "a missing binary reads as never-started, not as a strange exit code: {v}"
+    );
+    assert!(
+        v["warnings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not be started"),
+        "{v}"
+    );
+}
+
+#[test]
+fn a_hook_that_succeeds_produces_no_warning() {
+    let d = setup();
+    let id = mk(d.path(), "hooked");
+    write_hooks(
+        d.path(),
+        serde_json::json!([{
+            "id": "good", "enabled": true, "event": "task.status_changed",
+            "command": "true", "args": [], "timeout_ms": 5000
+        }]),
+    );
+    let (ok, v) = run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+    );
+    assert!(ok, "{v}");
+    assert!(
+        v["warnings"].as_array().unwrap().is_empty(),
+        "a working hook is not news: {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D5 — the one-level nesting rule has to be enforced, not just documented.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_subtask_may_not_itself_be_given_a_subtask() {
+    let d = setup();
+    let parent = mk(d.path(), "parent");
+    let (ok, child) = run(
+        d.path(),
+        &[
+            "task", "create", "--title", "child", "--owner", "agent", "--actor", "agent",
+            "--parent", &parent, "--json",
+        ],
+    );
+    assert!(ok, "one level is fine: {child}");
+    let child_id = child["data"]["id"].as_str().unwrap().to_string();
+
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "create",
+            "--title",
+            "grandchild",
+            "--owner",
+            "agent",
+            "--actor",
+            "agent",
+            "--parent",
+            &child_id,
+            "--json",
+        ],
+    );
+    assert!(!ok, "a second level must be refused: {v}");
+    assert_eq!(v["errors"][0]["code"], "INVALID_PARENT", "{v}");
+}
+
+#[test]
+fn refusing_a_grandchild_creates_no_task() {
+    let d = setup();
+    let parent = mk(d.path(), "parent");
+    let (_, child) = run(
+        d.path(),
+        &[
+            "task", "create", "--title", "child", "--owner", "agent", "--actor", "agent",
+            "--parent", &parent, "--json",
+        ],
+    );
+    let child_id = child["data"]["id"].as_str().unwrap().to_string();
+    run(
+        d.path(),
+        &[
+            "task",
+            "create",
+            "--title",
+            "grandchild",
+            "--owner",
+            "agent",
+            "--actor",
+            "agent",
+            "--parent",
+            &child_id,
+            "--json",
+        ],
+    );
+    let (_, listed) = run(d.path(), &["task", "list", "--json"]);
+    assert_eq!(
+        listed["data"].as_array().unwrap().len(),
+        2,
+        "only parent and child exist: {listed}"
+    );
+}
+
+/// Make a task's `audit.log` unwritable while leaving `task.md` writable, so the mutation
+/// commits and only the audit append fails.
+#[cfg(unix)]
+fn with_unwritable_audit<T>(root: &std::path::Path, id: &str, f: impl FnOnce() -> T) -> T {
+    use std::os::unix::fs::PermissionsExt;
+    let log = root
+        .join("workspaces/main/tasks")
+        .join(id)
+        .join("audit.log");
+    let original = std::fs::metadata(&log).unwrap().permissions();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let out = f();
+    std::fs::set_permissions(&log, original).unwrap();
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn a_patch_whose_audit_append_fails_still_commits_and_warns() {
+    // Asymmetric with the task write on purpose: this failure happens after the change is
+    // already stored, so reporting an error would deny a mutation that really occurred.
+    let d = setup();
+    let id = mk(d.path(), "trail");
+    let (ok, v) = with_unwritable_audit(d.path(), &id, || {
+        run(
+            d.path(),
+            &[
+                "task",
+                "set-title",
+                "--id",
+                &id,
+                "--title",
+                "kept",
+                "--actor",
+                "aaron",
+                "--json",
+            ],
+        )
+    });
+    assert!(ok, "the mutation stands: {v}");
+    assert_eq!(v["data"]["title"], "kept");
+    assert_eq!(v["warnings"][0]["code"], "AUDIT_WRITE_FAILED", "{v}");
+
+    let (_, shown) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(shown["data"]["title"], "kept", "and is on disk");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_transition_whose_audit_append_fails_still_commits_and_warns() {
+    let d = setup();
+    let id = mk(d.path(), "trail");
+    let (ok, v) = with_unwritable_audit(d.path(), &id, || {
+        run(
+            d.path(),
+            &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+        )
+    });
+    assert!(ok, "the mutation stands: {v}");
+    assert_eq!(v["data"]["status"], "running");
+    assert_eq!(v["warnings"][0]["code"], "AUDIT_WRITE_FAILED", "{v}");
+}
