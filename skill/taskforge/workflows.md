@@ -27,9 +27,13 @@ it aggressively, do not escalate, and do not move it yourself.
 When feedback arrives:
 
 ```bash
-taskforge task reject      --id TASK-0001 --actor aaron --text "Missing error schema" --json
+taskforge task add-comment --id TASK-0001 --actor aaron --text "Missing error schema" --json
+taskforge task reject      --id TASK-0001 --actor aaron --json
 taskforge task start       --id TASK-0001 --actor agent --json   # changes-requested -> running
 ```
+
+`reject` records the transition, not the reason — it takes no `--text`. Put the feedback in
+`add-comment` first, so the task carries why it came back.
 
 When the review merges:
 
@@ -84,6 +88,13 @@ retry blindly in a loop.
 taskforge task add-comment --id TASK-0001 --actor aaron --text "Premise changed; dropping." --json
 taskforge task block       --id TASK-0001 --actor aaron --json   # -> stuck
 taskforge task cancel      --id TASK-0001 --actor aaron --json   # -> cancelled
+```
+
+If the review already **merged**, this does not work — `block` and `cancel` are both refused, and
+the only moves left are `accept` and `fail`. Abandon it with `fail`:
+
+```bash
+taskforge task fail --id TASK-0001 --actor aaron --json   # merged -> failed
 ```
 
 ## When a command succeeds but warns

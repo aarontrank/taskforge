@@ -94,7 +94,7 @@ Each takes `--id`, `--actor`, optional `--version <n>` for optimistic concurrenc
 | `task complete` | running, merged | → done. Fails with `REVIEW_REQUIRED` if review was demanded and the task never went through it |
 | `task pending` | open, stuck | → pending. Planned into a wave, not yet dispatched |
 | `task wait` | running, stuck | → waiting-on-schedule. Slow non-review step, still on schedule |
-| `task block` | every state except open, done, cancelled | → stuck. Needs a decision, or a wait passed its `expected_by` |
+| `task block` | pending, running, in-review, changes-requested, waiting-on-schedule | → stuck. Needs a decision, or a wait passed its `expected_by`. Only from states where work is live or queued — not from `open`, and not from a settled `merged`/`failed` |
 | `task fail` | running, in-review, changes-requested, merged, waiting-on-schedule, stuck | → failed. `task start` retries it |
 | `task cancel` | **open, pending, stuck, failed only** | → cancelled. In-flight work must be `block`ed first — see below |
 | `task set-status --status <name>` | any legal move | Shorthand for the above; same guard |
@@ -103,6 +103,12 @@ Each takes `--id`, `--actor`, optional `--version <n>` for optimistic concurrenc
 `changes-requested`, `waiting-on-schedule`, and `merged` with `INVALID_STATUS_TRANSITION`. To
 drop a live task: `task block` (→ `stuck`), then `task cancel`. This is deliberate — walking away
 from work someone may already be reviewing takes two decisions, not one.
+
+**A `merged` task cannot be blocked or cancelled either** — its only moves are `accept`
+(→ `done`) and `fail` (→ `failed`). So the `block`-then-`cancel` route does not apply once a
+review has merged: to abandon work at that point, `fail` it. The reasoning is the same as for
+`cancel`, one step further along — a merged review is a result, so discarding it is a decision
+about that result rather than about a task in flight.
 
 `done` and `cancelled` are immutable: no transition leaves either. `failed` is terminal in the
 sense that no worker holds it, but `start` still retries it.
@@ -179,6 +185,15 @@ taskforge task add-artifact   --id TASK-0001 --path ./dist/out.json --mode link 
 `--mode copy` duplicates the file into the task folder; `--mode link` records the path only.
 A missing source file is an error (`ATTACHMENT_NOT_FOUND` / `ARTIFACT_NOT_FOUND`) rather than a
 dangling reference.
+
+`add-attachment` and `add-artifact` record a reference **on the task**, so they behave like the
+patch commands: both take `--version` and both append an audit entry (`add_attachment` /
+`add_artifact`).
+
+`add-worklog` and `add-comment` do **not** take `--version`. They append to `worklog.md` and
+`comments.md` and never touch the task record, so there is no version to conflict on and two
+agents writing at once cannot lose each other's entry. Each entry carries its own `--actor` and
+timestamp in the file.
 
 ## Recurrence
 

@@ -1,6 +1,6 @@
 ---
 name: taskforge
-description: Manage local tasks with the taskforge CLI — create, inspect, search, and drive tasks through the eleven-state workflow (pending, running, in-review, changes-requested, merged, waiting-on-schedule, stuck, done, failed, cancelled). Use when asked to create/update/list/search tasks, track multi-step or multi-agent work, record what was done, or check what is blocked, overdue, or awaiting review. Also use when asked what to work on next.
+description: Manage local tasks with the taskforge CLI — create, inspect, search, and drive tasks through the eleven-state workflow (open, pending, running, in-review, changes-requested, merged, waiting-on-schedule, stuck, done, failed, cancelled). Use when asked to create/update/list/search tasks, track multi-step or multi-agent work, record what was done, or check what is blocked, overdue, or awaiting review. Also use when asked what to work on next.
 allowed-tools: Bash(taskforge:*)
 ---
 
@@ -26,8 +26,9 @@ You drive tasks through the `taskforge` CLI. Data lives in `~/.taskforge` (overr
 6. **Log your work** with `task add-worklog` after meaningful progress — what was done, what
    remains, what blocked you. Worklogs are execution records; `add-comment` is discussion.
 7. **On `CONFLICT_VERSION_MISMATCH`,** re-read the task and retry only if the action still
-   applies. Something else changed it under you. Every mutating command takes `--version`, both
-   the status transitions and the field setters.
+   applies. Something else changed it under you. Every command that changes the task record takes
+   `--version` — the status transitions and the field setters alike. (`add-worklog` and
+   `add-comment` do not: they append to their own files and carry no version to conflict on.)
 8. **`IO_ERROR` means nothing was stored.** The task is unchanged on disk; whatever you were
    reporting upward did not happen. Never treat it as a partial success.
 
@@ -55,7 +56,8 @@ Consequences you will hit:
   do not mark it `stuck`. Only a wait that has passed `expected_by` is `stuck`.
 - **In-flight work cannot be cancelled directly.** `cancel` is legal only from `open`,
   `pending`, `stuck`, and `failed`. To abandon a `running` or `in-review` task, `block` it first
-  (→ `stuck`), then `cancel`. Deliberate: it makes dropping live work a two-step decision.
+  (→ `stuck`), then `cancel`. Deliberate: it makes dropping live work a two-step decision. Once a
+  review has **merged**, even that route closes — a merged task takes only `accept` or `fail`.
 - **One level of nesting.** `--parent` on a task that is already a subtask is refused with
   `INVALID_PARENT`.
 
