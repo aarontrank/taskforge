@@ -18,7 +18,7 @@ taskforge task start          --id TASK-0001 --actor agent --json
 taskforge task add-worklog    --id TASK-0001 --actor agent --text "Implemented X." --json
 taskforge task request-review --id TASK-0001 --actor agent --json
 taskforge task set-review     --id TASK-0001 --actor agent --json \
-  --review-id CR-301625168 --expected-by 2026-09-03T17:00:00Z
+  --review-id PR-4821 --expected-by 2026-09-03T17:00:00Z
 ```
 
 Then **stop**. The task is `in-review` and inside its window: waiting, not stuck. Do not poll
@@ -65,6 +65,31 @@ taskforge task tree --id "$parent" --json
 One level of nesting only, and enforced: `--parent` on a task that is already a subtask is
 refused with `INVALID_PARENT`. For ordering between subtasks use `add-blocker`, which is enforced
 at `start` rather than merely advisory.
+
+## Finding work that was abandoned
+
+The failure this catches: a worker starts a task, opens a review, and its session ends without
+closing anything. Nothing errors — the task simply stops moving.
+
+```bash
+taskforge task list --stale 7d --json      # nothing has touched these in a week
+taskforge task list --overdue --json       # and these blew their expected_by
+```
+
+Neither is a problem report on its own. Read each one and decide: resume it, `block` it if it
+needs a decision, or `accept` it if the review actually merged and only the bookkeeping is
+missing. A `merged` task showing up here means it is waiting on a human, not stuck.
+
+## Classifying work as you go
+
+```bash
+taskforge task create --title "Fix the parser" --owner agent --actor aaron \
+  --kind bug --ticket T-99 --tag parser --json
+```
+
+Set `--kind` when you know it and leave it unset when you do not — an unclassified task is
+reportable as such, whereas a wrong kind is a wrong number in a report nobody will re-derive.
+`--tag` is for the project or theme and can be repeated.
 
 ## Concurrency
 

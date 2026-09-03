@@ -66,9 +66,9 @@ Output is human-readable by default; pass `--json` for the machine envelope:
 ```
 $ taskforge task list
 ID         STATUS              WORKER                 REVIEW         EXPECTED-BY           TITLE
-TASK-0001  in-review           addresscr-CR-301625168 CR-301625168   2026-09-03T17:00:00Z  S1 crew list
-TASK-0002  merged              -                      -              -                     S2 cast list
-TASK-0003  open                -                      -              -                     S3 shared header  [blocked by TASK-0001]
+TASK-0001  in-review           review-worker-1        PR-4821        2026-09-03T17:00:00Z  Port the storage layer
+TASK-0002  merged              -                      -              -                     Port the CLI
+TASK-0003  open                -                      -              -                     Shared header  [blocked by TASK-0001]
 ```
 
 Run the tests and lints:
@@ -199,6 +199,21 @@ on. Read it with `taskforge task audit --id TASK-0001 --json`.
 — fails the command with `IO_ERROR` and stores nothing. The CLI never reports a status or version
 it did not persist.
 
+**Classification, for reporting.** A task carries `kind` (a closed set: `feature`, `bug`, `chore`,
+`investigation`, `oncall`, `doc`), open-ended `tags`, and an opaque `ticket` naming the external
+tracker item it delivers. `kind` is closed on purpose: free text drifts into `bug`/`bugfix`/`Bug`
+and the drift only shows up as a wrong number in a report months later. No kind means
+unclassified, which is a reportable answer rather than a guess.
+
+**Reviews are plural.** Work crossing package ownership boundaries needs one review per package,
+so `reviews` is a list. Files written when it was singular still load and migrate on write.
+
+**Finding work that stopped moving.** `task list --overdue` catches anything past its
+`expected_by`; `task list --stale 7d` catches anything untouched for longer than an age
+(`12h`/`7d`/`2w`, or a bare number of days). Both skip the terminal statuses — a task finished in
+January has not moved since, and that is correct — and both *include* `merged`, which is the state
+that rots while waiting on a human to accept it.
+
 **Hooks.** Local commands fired *after* a mutation commits, configured in `config.json`, with
 the event payload on stdin. A hook that fails, hangs, or does not exist never rolls the change
 back — hooks are notifications, not gates — and is reported as a `HOOK_FAILED` entry in the
@@ -242,7 +257,7 @@ The Rust implementation is the only implementation; the earlier TypeScript versi
 Next.js web UI have been removed. Human inspection is the markdown files themselves plus
 `taskforge task list`.
 
-`122` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
+`157` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
 guards, filesystem round-trips, hook execution including timeouts, and the CLI end to end —
 including a test that every one of the eleven statuses is reachable through the binary, and
 tests that drive the write path against an unwritable file so a refused write cannot regress
@@ -254,6 +269,13 @@ bug would, and silently. The transition table in `reference.md` is parsed and di
 `can_transition`; every documented flag is checked against that command's `--help`; every
 runnable example is executed; every error and warning code the CLI emits must appear in the
 reference. The rule: no factual claim about the CLI is verified by reading it.
+
+## Possible future work
+
+[`ENHANCEMENTS.md`](ENHANCEMENTS.md) records ideas that were scoped and deliberately deferred —
+reports, reflection mining, review reconciliation, a read-only dashboard — each with the reason
+it is not built and the observation that would justify building it. Several have a cheap
+alternative that works today and is noted alongside.
 
 ## Licence
 

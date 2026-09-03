@@ -68,10 +68,11 @@ fails with `OWNER_NOT_FOUND`.
 
 ```bash
 taskforge task create --title "Port storage" --owner agent --actor aaron --json \
-  [--description "..."] [--review-required] [--parent TASK-0001]
+  [--description "..."] [--review-required] [--parent TASK-0001] \
+  [--kind bug] [--ticket T-99] [--tag parser] [--tag backend]
 
 taskforge task show   --id TASK-0001 --json
-taskforge task list   --json [--status <status>] [--archived]
+taskforge task list   --json [--status <status>] [--archived] [--overdue] [--stale 7d]
 taskforge task search --text "storage" --json      # matches title and description
 taskforge task tree   --id TASK-0001 --json        # task plus its subtasks
 taskforge task audit  --id TASK-0001 --json        # mutation history: creation, status changes, field patches
@@ -122,23 +123,84 @@ All eleven statuses are reachable from the CLI. `set-status` is guarded by the s
 table as the named commands, so it is a shorthand, not an escape hatch: an illegal move still
 returns `INVALID_STATUS_TRANSITION`, and an unknown name returns `INVALID_STATUS`.
 
+## Classification
+
+What a task *is*, for reporting. Separate from its execution state.
+
+```bash
+taskforge task set-kind    --id TASK-0001 --kind bug        --actor aaron --json
+taskforge task set-ticket  --id TASK-0001 --ticket T-99     --actor aaron --json
+taskforge task add-tag     --id TASK-0001 --tag parser      --actor aaron --json
+taskforge task remove-tag  --id TASK-0001 --tag parser      --actor aaron --json
+```
+
+`kind` is a **closed set**: `feature`, `bug`, `chore`, `investigation`, `oncall`, `doc`.
+Anything else is refused with `INVALID_KIND`, and the error names the legal values. The set is
+closed on purpose — free text drifts into `bug`/`bugfix`/`Bug` and the drift only surfaces as a
+wrong number in a report months later. A task with no kind is *unclassified*, which is a
+reportable bucket rather than a guess.
+
+`tags` are open-ended: projects, themes, components. Adding a tag twice is a no-op. Use these
+for anything that would otherwise want a new `kind`.
+
+`ticket` is the external tracker item this task delivers — an opaque string. taskforge does not
+know or care which tracker it came from, so it never validates or resolves it.
+
+## Reviews
+
+A task can be gated on **several** reviews, because work crossing package ownership boundaries
+needs one review per package.
+
+```bash
+taskforge task add-review    --id TASK-0001 --review-id PR-1 --actor agent --json
+taskforge task remove-review --id TASK-0001 --review-id PR-1 --actor agent --json
+```
+
+`set-review --review-id` **replaces** the whole list; `add-review` appends. Adding the same
+review twice is a no-op.
+
+Task files written before this field became plural carry a singular `review_id`. Those still
+load — the old value becomes a one-element list — and writing the task back stores the plural
+form, so reading and writing migrates it.
+
 ## Board fields
 
 ```bash
 taskforge task set-review --id TASK-0001 --actor agent --json \
-  [--review-id CR-301625168] [--expected-by 2026-09-03T17:00:00Z]
+  [--review-id PR-4821] [--expected-by 2026-09-03T17:00:00Z]
+
+`--review-id` here sets the review list to exactly that one review. To gate a task on more than
+one, use `add-review`.
 
 taskforge task set-worker --id TASK-0001 --actor agent --json \
-  [--worker addresscr-CR-301625168] [--checkout 3]
+  [--worker review-worker-1] [--checkout 3]
 ```
 
 Omitted flags leave the current value alone, so one field can be set without clearing the others.
 
 **`--checkout` is not `--workspace`.** `--checkout` records the *development* workspace the work
-happens in — an `imdb-next-gen` number, a git worktree name, a sandbox id. The global
+happens in — a numbered dev workspace, a git worktree name, a sandbox id. The global
 `--workspace` flag selects which taskforge *partition* the task is filed in (`main`, `side`).
 Putting a per-stream checkout id in `--workspace` would file every stream in its own partition
 and break `task list`.
+
+## Finding work that stopped moving
+
+```bash
+taskforge task list --overdue --json          # past its expected_by
+taskforge task list --stale 7d --json         # untouched for over a week
+taskforge task list --stale 12h --status running --json    # filters compose
+```
+
+`--stale` takes `12h`, `7d`, `2w`, or a bare number meaning days. Anything else — including `0`
+and negatives — is refused with `INVALID_AGE` rather than silently matching everything.
+
+Both filters **ignore the terminal statuses**. A task finished in January has not been touched
+since, and that is correct rather than abandoned; surfacing it would bury the tasks that do need
+attention.
+
+`merged` is deliberately *not* ignored. It is the state that rots silently while waiting for a
+human to `accept`, so it is exactly what these queries are for.
 
 ## Patch-style updates
 
@@ -167,7 +229,10 @@ taskforge task set-worker --id TASK-0001 --worker w1 --actor agent --version 7 -
 ```
 
 Every one of them records an audit entry naming `--actor` and the action — `set_title`,
-`assign`, `add_blocker`, `archive`, and so on.
+`assign`, `add_blocker`, `set_kind`, `add_tag`, `add_review`, `archive`, and so on.
+
+The classification and review setters above (`set-kind`, `set-ticket`, `add-tag`, `remove-tag`,
+`add-review`, `remove-review`) are patch commands too: same `--version` guard, same audit entry.
 
 `archive` and `soft-delete` set flags; they do **not** change `status`. An archived task keeps
 whatever status it had.
@@ -225,6 +290,8 @@ date), `relative` (advance from completion time). Month arithmetic clamps to the
 | `ATTACHMENT_NOT_FOUND` / `ARTIFACT_NOT_FOUND` | Source file does not exist |
 | `INVALID_STATUS` | Unrecognized `--status` filter value |
 | `INVALID_PARENT` | `--parent` names a task that is already a subtask; one level only |
+| `INVALID_KIND` | `--kind` is not one of the closed set; the message names the legal values |
+| `INVALID_AGE` | `--stale` could not be read as an age; try `12h`, `7d`, `2w`, or a number of days |
 | `OWNER_EXISTS` | Owner name already registered |
 | `IO_ERROR` | A write failed. **Nothing was stored** — the task is unchanged on disk, and any status or version in the response would have been a fiction, so none is returned |
 

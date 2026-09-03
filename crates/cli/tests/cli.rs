@@ -223,7 +223,7 @@ fn review_id_and_expected_by_are_settable_and_persist() {
             "--id",
             &id,
             "--review-id",
-            "CR-301625168",
+            "PR-4821",
             "--expected-by",
             "2026-09-03T17:00:00Z",
             "--actor",
@@ -234,7 +234,7 @@ fn review_id_and_expected_by_are_settable_and_persist() {
     assert!(ok, "set-review succeeds");
 
     let (_, shown) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
-    assert_eq!(shown["data"]["review_id"], "CR-301625168");
+    assert_eq!(shown["data"]["reviews"][0], "PR-4821");
     assert_eq!(shown["data"]["expected_by"], "2026-09-03T17:00:00Z");
 }
 
@@ -789,7 +789,7 @@ fn the_dev_checkout_is_a_separate_field_from_the_task_partition() {
     let d = setup();
     let id = mk(d.path(), "S1");
     // `workspace` partitions the task store (main, side). `checkout` is the dev workspace the
-    // work happens in (an imdb-next-gen number, a worktree name). Conflating them would shard
+    // work happens in (a numbered dev workspace, a worktree name). Conflating them would shard
     // the task store one-per-stream and break `task list`.
     let (ok, r) = run(
         d.path(),
@@ -799,7 +799,7 @@ fn the_dev_checkout_is_a_separate_field_from_the_task_partition() {
             "--id",
             &id,
             "--worker",
-            "IMDbNextGen3",
+            "sandbox-3",
             "--checkout",
             "3",
             "--actor",
@@ -808,7 +808,7 @@ fn the_dev_checkout_is_a_separate_field_from_the_task_partition() {
         ],
     );
     assert!(ok, "set-worker succeeds: {r}");
-    assert_eq!(r["data"]["worker"], "IMDbNextGen3");
+    assert_eq!(r["data"]["worker"], "sandbox-3");
     assert_eq!(r["data"]["checkout"], "3");
     assert_eq!(
         r["data"]["workspace"], "main",
@@ -831,7 +831,7 @@ fn set_worker_and_set_review_each_leave_the_other_pair_alone() {
             "--id",
             &id,
             "--review-id",
-            "CR-1",
+            "PR-1",
             "--expected-by",
             "2026-09-03T17:00:00Z",
             "--actor",
@@ -858,7 +858,7 @@ fn set_worker_and_set_review_each_leave_the_other_pair_alone() {
 
     let (_, r) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
     assert_eq!(
-        r["data"]["review_id"], "CR-1",
+        r["data"]["reviews"][0], "PR-1",
         "set-worker did not clear the review fields"
     );
     assert_eq!(r["data"]["expected_by"], "2026-09-03T17:00:00Z");
@@ -1120,7 +1120,7 @@ fn a_field_patch_records_its_action_and_actor_in_the_audit_log() {
             "--id",
             &id,
             "--review-id",
-            "CR-1",
+            "PR-1",
             "--actor",
             "aaron",
             "--json",
@@ -1545,4 +1545,487 @@ fn a_transition_whose_audit_append_fails_still_commits_and_warns() {
     assert!(ok, "the mutation stands: {v}");
     assert_eq!(v["data"]["status"], "running");
     assert_eq!(v["warnings"][0]["code"], "AUDIT_WRITE_FAILED", "{v}");
+}
+
+// ---------------------------------------------------------------------------
+// S1 — capture schema: kind, tags, ticket, plural reviews.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_task_can_be_classified_at_creation() {
+    let d = setup();
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "create",
+            "--title",
+            "fix the parser",
+            "--owner",
+            "agent",
+            "--actor",
+            "agent",
+            "--kind",
+            "bug",
+            "--ticket",
+            "T-99",
+            "--tag",
+            "parser",
+            "--tag",
+            "backend",
+            "--json",
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["data"]["kind"], "bug");
+    assert_eq!(v["data"]["ticket"], "T-99");
+    assert_eq!(v["data"]["tags"][0], "parser");
+    assert_eq!(v["data"]["tags"][1], "backend");
+}
+
+#[test]
+fn a_task_created_without_a_kind_is_unclassified_rather_than_guessed() {
+    let d = setup();
+    let id = mk(d.path(), "unclassified");
+    let (_, v) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert!(v["data"]["kind"].is_null(), "{v}");
+    assert_eq!(v["data"]["tags"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn an_unknown_kind_is_refused_at_creation() {
+    let d = setup();
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task", "create", "--title", "x", "--owner", "agent", "--actor", "agent", "--kind",
+            "bugfix", "--json",
+        ],
+    );
+    assert!(!ok, "a kind off the closed set must be refused: {v}");
+    assert_eq!(v["errors"][0]["code"], "INVALID_KIND", "{v}");
+}
+
+#[test]
+fn refusing_an_unknown_kind_creates_no_task() {
+    let d = setup();
+    run(
+        d.path(),
+        &[
+            "task", "create", "--title", "x", "--owner", "agent", "--actor", "agent", "--kind",
+            "nope", "--json",
+        ],
+    );
+    let (_, listed) = run(d.path(), &["task", "list", "--json"]);
+    assert_eq!(listed["data"].as_array().unwrap().len(), 0, "{listed}");
+}
+
+#[test]
+fn kind_ticket_and_tags_are_settable_after_creation() {
+    let d = setup();
+    let id = mk(d.path(), "classify me");
+    for args in [
+        vec!["set-kind", "--kind", "investigation"],
+        vec!["set-ticket", "--ticket", "T-7"],
+        vec!["add-tag", "--tag", "alpha"],
+        vec!["add-tag", "--tag", "beta"],
+    ] {
+        let mut argv = vec!["task"];
+        argv.extend(args);
+        argv.extend(["--id", &id, "--actor", "aaron", "--json"]);
+        let (ok, v) = run(d.path(), &argv);
+        assert!(ok, "{argv:?}: {v}");
+    }
+    let (_, v) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(v["data"]["kind"], "investigation");
+    assert_eq!(v["data"]["ticket"], "T-7");
+    assert_eq!(v["data"]["tags"].as_array().unwrap().len(), 2);
+
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "remove-tag",
+            "--id",
+            &id,
+            "--tag",
+            "alpha",
+            "--actor",
+            "aaron",
+            "--json",
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["data"]["tags"].as_array().unwrap(), &["beta"]);
+}
+
+#[test]
+fn adding_the_same_tag_twice_does_not_duplicate_it() {
+    let d = setup();
+    let id = mk(d.path(), "tagged");
+    for _ in 0..2 {
+        run(
+            d.path(),
+            &[
+                "task", "add-tag", "--id", &id, "--tag", "same", "--actor", "aaron", "--json",
+            ],
+        );
+    }
+    let (_, v) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(v["data"]["tags"].as_array().unwrap(), &["same"], "{v}");
+}
+
+#[test]
+fn a_task_can_carry_several_reviews() {
+    // One task spanning several packages needs one review each; a single field cannot say that.
+    let d = setup();
+    let id = mk(d.path(), "spans packages");
+    for r in ["PR-1", "PR-2"] {
+        let (ok, v) = run(
+            d.path(),
+            &[
+                "task",
+                "add-review",
+                "--id",
+                &id,
+                "--review-id",
+                r,
+                "--actor",
+                "agent",
+                "--json",
+            ],
+        );
+        assert!(ok, "{v}");
+    }
+    let (_, v) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(
+        v["data"]["reviews"].as_array().unwrap(),
+        &["PR-1", "PR-2"],
+        "{v}"
+    );
+
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "remove-review",
+            "--id",
+            &id,
+            "--review-id",
+            "PR-1",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["data"]["reviews"].as_array().unwrap(), &["PR-2"]);
+}
+
+#[test]
+fn set_review_replaces_the_whole_list() {
+    let d = setup();
+    let id = mk(d.path(), "one review");
+    for r in ["PR-1", "PR-2"] {
+        run(
+            d.path(),
+            &[
+                "task",
+                "add-review",
+                "--id",
+                &id,
+                "--review-id",
+                r,
+                "--actor",
+                "agent",
+                "--json",
+            ],
+        );
+    }
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "set-review",
+            "--id",
+            &id,
+            "--review-id",
+            "PR-9",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(
+        v["data"]["reviews"].as_array().unwrap(),
+        &["PR-9"],
+        "set-review replaces; add-review appends: {v}"
+    );
+}
+
+#[test]
+fn a_task_file_written_with_the_legacy_singular_review_id_still_loads() {
+    // Guards the migration: task files predating the plural field must not become unreadable.
+    let d = setup();
+    let id = mk(d.path(), "legacy");
+    let path = d
+        .path()
+        .join("workspaces/main/tasks")
+        .join(&id)
+        .join("task.md");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let legacy = text.replace("reviews: []", "review_id: PR-legacy");
+    assert_ne!(legacy, text, "the fixture actually rewrote the field");
+    std::fs::write(&path, legacy).unwrap();
+
+    let (ok, v) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert!(ok, "a legacy file still reads: {v}");
+    assert_eq!(
+        v["data"]["reviews"].as_array().unwrap(),
+        &["PR-legacy"],
+        "{v}"
+    );
+}
+
+#[test]
+fn the_new_capture_fields_are_audited_against_their_actor() {
+    let d = setup();
+    let id = mk(d.path(), "audited");
+    for args in [
+        vec!["set-kind", "--kind", "chore"],
+        vec!["set-ticket", "--ticket", "T-1"],
+        vec!["add-tag", "--tag", "x"],
+        vec!["remove-tag", "--tag", "x"],
+        vec!["add-review", "--review-id", "PR-1"],
+        vec!["remove-review", "--review-id", "PR-1"],
+    ] {
+        let mut argv = vec!["task"];
+        argv.extend(args);
+        argv.extend(["--id", &id, "--actor", "aaron", "--json"]);
+        run(d.path(), &argv);
+    }
+    let actions = audit_actions(d.path(), &id);
+    for expected in [
+        "set_kind",
+        "set_ticket",
+        "add_tag",
+        "remove_tag",
+        "add_review",
+        "remove_review",
+    ] {
+        assert!(
+            actions.iter().any(|a| a == expected),
+            "{expected} missing from {actions:?}"
+        );
+    }
+}
+
+#[test]
+fn the_new_setters_honour_the_version_guard() {
+    let d = setup();
+    let id = mk(d.path(), "contended");
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "set-kind",
+            "--id",
+            &id,
+            "--kind",
+            "bug",
+            "--actor",
+            "aaron",
+            "--version",
+            "99",
+            "--json",
+        ],
+    );
+    assert!(!ok, "{v}");
+    assert_eq!(v["errors"][0]["code"], "CONFLICT_VERSION_MISMATCH", "{v}");
+}
+
+// ---------------------------------------------------------------------------
+// S2 — staleness: surfacing work that stopped moving.
+// ---------------------------------------------------------------------------
+
+/// Rewrite a stored task's `updated_at`, standing in for the passage of time.
+fn backdate(root: &std::path::Path, id: &str, updated_at: &str) {
+    let path = root.join("workspaces/main/tasks").join(id).join("task.md");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.starts_with("updated_at:") {
+                format!("updated_at: {updated_at}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    std::fs::write(&path, out.join("\n")).unwrap();
+}
+
+fn ids(v: &serde_json::Value) -> Vec<String> {
+    v["data"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|t| t["id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn stale_lists_only_tasks_that_have_stopped_moving() {
+    let d = setup();
+    let old = mk(d.path(), "abandoned");
+    let fresh = mk(d.path(), "active");
+    run(
+        d.path(),
+        &["task", "start", "--id", &old, "--actor", "agent", "--json"],
+    );
+    run(
+        d.path(),
+        &[
+            "task", "start", "--id", &fresh, "--actor", "agent", "--json",
+        ],
+    );
+    backdate(d.path(), &old, "2026-01-01T00:00:00Z");
+
+    let (ok, v) = run(d.path(), &["task", "list", "--stale", "7d", "--json"]);
+    assert!(ok, "{v}");
+    assert_eq!(ids(&v), vec![old], "only the abandoned one: {v}");
+}
+
+#[test]
+fn stale_ignores_finished_work_however_old() {
+    // A task done in January has not moved since, and that is correct rather than abandoned.
+    let d = setup();
+    let done = mk(d.path(), "finished long ago");
+    run(
+        d.path(),
+        &["task", "start", "--id", &done, "--actor", "agent", "--json"],
+    );
+    run(
+        d.path(),
+        &[
+            "task", "complete", "--id", &done, "--actor", "agent", "--json",
+        ],
+    );
+    backdate(d.path(), &done, "2026-01-01T00:00:00Z");
+
+    let (_, v) = run(d.path(), &["task", "list", "--stale", "7d", "--json"]);
+    assert!(ids(&v).is_empty(), "{v}");
+}
+
+#[test]
+fn a_merged_task_waiting_to_be_accepted_does_go_stale() {
+    // The reason `merged` is not terminal: it is the state that rots while awaiting a human.
+    let d = setup();
+    let id = mk(d.path(), "awaiting acceptance");
+    for s in ["start", "request-review", "merge"] {
+        run(
+            d.path(),
+            &["task", s, "--id", &id, "--actor", "agent", "--json"],
+        );
+    }
+    backdate(d.path(), &id, "2026-01-01T00:00:00Z");
+    let (_, v) = run(d.path(), &["task", "list", "--stale", "7d", "--json"]);
+    assert_eq!(ids(&v), vec![id], "{v}");
+}
+
+#[test]
+fn overdue_lists_only_tasks_past_their_expected_by() {
+    let d = setup();
+    let late = mk(d.path(), "late");
+    let ontime = mk(d.path(), "on time");
+    for id in [&late, &ontime] {
+        run(
+            d.path(),
+            &["task", "start", "--id", id, "--actor", "agent", "--json"],
+        );
+    }
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-review",
+            "--id",
+            &late,
+            "--expected-by",
+            "2026-01-01T00:00:00Z",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-review",
+            "--id",
+            &ontime,
+            "--expected-by",
+            "2099-01-01T00:00:00Z",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    let (ok, v) = run(d.path(), &["task", "list", "--overdue", "--json"]);
+    assert!(ok, "{v}");
+    assert_eq!(ids(&v), vec![late], "{v}");
+}
+
+#[test]
+fn a_task_with_no_expected_by_is_not_overdue() {
+    let d = setup();
+    let id = mk(d.path(), "no window");
+    run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+    );
+    let (_, v) = run(d.path(), &["task", "list", "--overdue", "--json"]);
+    assert!(ids(&v).is_empty(), "{v}");
+}
+
+#[test]
+fn a_nonsense_stale_age_is_refused_rather_than_ignored() {
+    let d = setup();
+    let (ok, v) = run(
+        d.path(),
+        &["task", "list", "--stale", "yesterday", "--json"],
+    );
+    assert!(!ok, "{v}");
+    assert_eq!(v["errors"][0]["code"], "INVALID_AGE", "{v}");
+}
+
+#[test]
+fn stale_and_status_filters_compose() {
+    let d = setup();
+    let running = mk(d.path(), "running and old");
+    let pending = mk(d.path(), "pending and old");
+    run(
+        d.path(),
+        &[
+            "task", "start", "--id", &running, "--actor", "agent", "--json",
+        ],
+    );
+    run(
+        d.path(),
+        &[
+            "task", "pending", "--id", &pending, "--actor", "agent", "--json",
+        ],
+    );
+    for id in [&running, &pending] {
+        backdate(d.path(), id, "2026-01-01T00:00:00Z");
+    }
+    let (_, v) = run(
+        d.path(),
+        &[
+            "task", "list", "--stale", "7d", "--status", "running", "--json",
+        ],
+    );
+    assert_eq!(ids(&v), vec![running], "{v}");
 }

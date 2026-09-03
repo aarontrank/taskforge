@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use taskforge_core::fsstore::FsStore;
 use taskforge_core::hooks::{HookConfig, HookEngine};
 use taskforge_core::model::{
-    DueStrategy, Owner, OwnerType, Recurrence, RecurrenceFrequency, Task, TaskStatus,
+    parse_age, DueStrategy, Owner, OwnerType, Recurrence, RecurrenceFrequency, Task, TaskKind,
+    TaskStatus,
 };
 use taskforge_core::service::{TaskError, TaskService};
 use taskforge_core::store::{AuditEntry, TaskStore};
@@ -152,6 +153,25 @@ fn render(command: &str, data: Option<&serde_json::Value>) -> String {
     format!("{}: {}\n", command, summary_line(data))
 }
 
+/// An unknown-kind message that names the whole legal set, so the fix is in the error.
+fn kind_message(e: &taskforge_core::model::UnknownKind) -> String {
+    let legal: Vec<&str> = TaskKind::ALL.iter().map(|k| k.as_str()).collect();
+    format!("{e}; expected one of: {}", legal.join(", "))
+}
+
+/// The REVIEW column for one row. A task can carry several reviews and the column is narrow, so
+/// show the first and count the rest rather than truncating mid-id.
+fn reviews_cell(t: &serde_json::Value) -> String {
+    let Some(list) = t.get("reviews").and_then(|r| r.as_array()) else {
+        return "-".to_string();
+    };
+    match list.len() {
+        0 => "-".to_string(),
+        1 => str_of_raw(&list[0]),
+        n => format!("{} (+{})", str_of_raw(&list[0]), n - 1),
+    }
+}
+
 fn str_of(v: &serde_json::Value, key: &str) -> String {
     match v.get(key) {
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -193,7 +213,7 @@ fn task_table(rows: &[serde_json::Value]) -> String {
             str_of(t, "id"),
             str_of(t, "status"),
             str_of(t, "worker"),
-            str_of(t, "review_id"),
+            reviews_cell(t),
             str_of(t, "expected_by"),
             title
         ));
@@ -214,9 +234,10 @@ fn task_detail(t: &serde_json::Value) -> String {
         out.push_str(&format!("  {label:<16} {}\n", str_of(t, key)));
     }
     let optional = [
+        ("kind", "kind"),
+        ("ticket", "ticket"),
         ("review required", "review_required"),
         ("reviewer", "reviewer"),
-        ("review", "review_id"),
         ("expected by", "expected_by"),
         ("worker", "worker"),
         ("checkout", "checkout"),
@@ -233,6 +254,8 @@ fn task_detail(t: &serde_json::Value) -> String {
         }
     }
     for (label, key) in [
+        ("reviews", "reviews"),
+        ("tags", "tags"),
         ("blocked by", "blocked_by"),
         ("attachments", "attachment_refs"),
         ("artifacts", "artifact_refs"),
@@ -333,6 +356,15 @@ enum TaskCmd {
         /// Parent task, making this a subtask. One level of nesting only.
         #[arg(long)]
         parent: Option<String>,
+        /// What sort of work this is, for reporting. One of the closed set.
+        #[arg(long)]
+        kind: Option<String>,
+        /// External tracker item this task delivers. An opaque string.
+        #[arg(long)]
+        ticket: Option<String>,
+        /// Open-ended label. Repeat for several.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
     Show {
         #[arg(long)]
@@ -344,6 +376,13 @@ enum TaskCmd {
         /// Include archived and soft-deleted tasks, which are hidden by default.
         #[arg(long)]
         archived: bool,
+        /// Only tasks whose `expected_by` has passed. Finished tasks never qualify.
+        #[arg(long)]
+        overdue: bool,
+        /// Only tasks untouched for longer than this — `12h`, `7d`, `2w`, or a bare number of
+        /// days. Finished tasks never qualify; `merged` does, because it waits on a human.
+        #[arg(long)]
+        stale: Option<String>,
     },
     /// open|pending -> running
     Start(Act),
@@ -386,7 +425,7 @@ enum TaskCmd {
     },
     /// Record who holds this task and which development checkout they hold it in.
     ///
-    /// `--checkout` is the dev workspace (an imdb-next-gen number, a worktree name), which is
+    /// `--checkout` is the dev workspace (a numbered dev workspace, a worktree name), which is
     /// a different thing from the global `--workspace` flag that selects a taskforge partition.
     SetWorker {
         #[command(flatten)]
@@ -447,6 +486,45 @@ enum TaskCmd {
         act: Act,
         #[arg(long)]
         blocked_by: String,
+    },
+    /// Classify the work, for reporting.
+    SetKind {
+        #[command(flatten)]
+        act: Act,
+        #[arg(long)]
+        kind: String,
+    },
+    /// Record the external tracker item this task delivers.
+    SetTicket {
+        #[command(flatten)]
+        act: Act,
+        #[arg(long)]
+        ticket: String,
+    },
+    AddTag {
+        #[command(flatten)]
+        act: Act,
+        #[arg(long)]
+        tag: String,
+    },
+    RemoveTag {
+        #[command(flatten)]
+        act: Act,
+        #[arg(long)]
+        tag: String,
+    },
+    /// Append a review to the task's list, for work spanning several packages.
+    AddReview {
+        #[command(flatten)]
+        act: Act,
+        #[arg(long)]
+        review_id: String,
+    },
+    RemoveReview {
+        #[command(flatten)]
+        act: Act,
+        #[arg(long)]
+        review_id: String,
     },
     /// Recurrence schedule for a task.
     SetRecurrence {
@@ -668,8 +746,17 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             description,
             review_required,
             parent,
+            kind,
+            ticket,
+            tags,
         } => {
             let label = "task create";
+            // Parsed before anything is allocated, so a bad kind creates no task.
+            let kind = match kind.as_deref().map(TaskKind::parse) {
+                Some(Ok(k)) => Some(k),
+                Some(Err(e)) => Envelope::err(label, "INVALID_KIND", kind_message(&e)).emit(),
+                None => None,
+            };
             if !load_owners(root).iter().any(|o| o.name == owner) {
                 Envelope::err(
                     label,
@@ -702,6 +789,9 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             task.description = description;
             task.review_required = review_required;
             task.parent_task_id = parent;
+            task.kind = kind;
+            task.ticket = ticket;
+            task.tags = tags;
             if let Err(e) = store.put(task.clone()) {
                 fail(
                     label,
@@ -725,7 +815,12 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             }
         }
 
-        TaskCmd::List { status, archived } => {
+        TaskCmd::List {
+            status,
+            archived,
+            overdue,
+            stale,
+        } => {
             let label = "task list";
             let mut tasks: Vec<Task> = store.list();
             if !archived {
@@ -735,6 +830,24 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
                 match TaskStatus::parse(&want) {
                     Ok(s) => tasks.retain(|t| t.status == s),
                     Err(e) => Envelope::err(label, "INVALID_STATUS", e.to_string()).emit(),
+                }
+            }
+            // Filters compose: each narrows what the previous one left.
+            let now = now();
+            if overdue {
+                tasks.retain(|t| t.is_overdue(&now));
+            }
+            if let Some(age) = stale {
+                match parse_age(&age) {
+                    Some(max) => tasks.retain(|t| t.is_stale(&now, max)),
+                    None => Envelope::err(
+                        label,
+                        "INVALID_AGE",
+                        format!(
+                            "cannot read {age:?} as an age; try 12h, 7d, 2w, or a number of days"
+                        ),
+                    )
+                    .emit(),
                 }
             }
             tasks.sort_by(|a, b| a.id.cmp(&b.id));
@@ -772,8 +885,9 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             // An absent flag leaves its own field alone, so one can be set without clearing
             // the other.
             patch("task set-review", &mut store, &act, "set_review", |t| {
-                if review_id.is_some() {
-                    t.review_id = review_id;
+                // Replaces the list rather than appending — `add-review` is the append.
+                if let Some(id) = review_id {
+                    t.reviews = vec![id];
                 }
                 if expected_by.is_some() {
                     t.expected_by = expected_by;
@@ -884,6 +998,42 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             &act,
             "remove_blocker",
             |t| t.blocked_by.retain(|b| b != &blocked_by),
+        ),
+        TaskCmd::SetKind { act, kind } => {
+            let label = "task set-kind";
+            match TaskKind::parse(&kind) {
+                Ok(k) => patch(label, &mut store, &act, "set_kind", |t| t.kind = Some(k)),
+                Err(e) => Envelope::err(label, "INVALID_KIND", kind_message(&e)).emit(),
+            }
+        }
+        TaskCmd::SetTicket { act, ticket } => {
+            patch("task set-ticket", &mut store, &act, "set_ticket", |t| {
+                t.ticket = Some(ticket)
+            })
+        }
+        TaskCmd::AddTag { act, tag } => patch("task add-tag", &mut store, &act, "add_tag", |t| {
+            if !t.tags.contains(&tag) {
+                t.tags.push(tag);
+            }
+        }),
+        TaskCmd::RemoveTag { act, tag } => {
+            patch("task remove-tag", &mut store, &act, "remove_tag", |t| {
+                t.tags.retain(|x| x != &tag)
+            })
+        }
+        TaskCmd::AddReview { act, review_id } => {
+            patch("task add-review", &mut store, &act, "add_review", |t| {
+                if !t.reviews.contains(&review_id) {
+                    t.reviews.push(review_id);
+                }
+            })
+        }
+        TaskCmd::RemoveReview { act, review_id } => patch(
+            "task remove-review",
+            &mut store,
+            &act,
+            "remove_review",
+            |t| t.reviews.retain(|r| r != &review_id),
         ),
         TaskCmd::SetRecurrence {
             act,

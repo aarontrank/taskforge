@@ -251,7 +251,7 @@ mod tests {
         let (_d, mut s) = root();
         let mut t = task("TASK-0001");
         t.status = TaskStatus::InReview;
-        t.review_id = Some("CR-1".into());
+        t.reviews = vec!["PR-1".into()];
         t.expected_by = Some("2026-09-03T00:00:00Z".into());
         t.worker = Some("w1".into());
         t.blocked_by = vec!["TASK-0002".into()];

@@ -67,10 +67,27 @@ of them. All are guarded by the same transition table, `set-status` included, so
 shorthand and not a way around the guards. The full legal-move matrix is in
 [reference.md](reference.md).
 
-Four fields carry the execution state: `review_id` (which review gates this) and `expected_by`
+Four fields carry the execution state: `reviews` (which reviews gate this — plural, because work
+crossing package boundaries needs one each) and `expected_by`
 (when the wait becomes overdue) via `task set-review`; `worker` (who holds it) and `checkout`
 (which dev workspace they hold it in) via `task set-worker`. Note `checkout` is the *development*
 workspace — distinct from the global `--workspace` flag, which selects a taskforge partition.
+
+Three fields say what the work *is*, for reporting: `kind` (a **closed** set — `feature`, `bug`,
+`chore`, `investigation`, `oncall`, `doc`; anything else is `INVALID_KIND`), `tags` (open-ended
+projects and themes), and `ticket` (the external tracker item, an opaque string). Set them at
+creation with `--kind`/`--ticket`/`--tag` or later with `set-kind`/`set-ticket`/`add-tag`. A task
+with no kind is unclassified, which is honest — do not guess one to fill the field.
+
+## Finding what stalled
+
+```bash
+taskforge task list --overdue --json      # past its expected_by
+taskforge task list --stale 7d --json     # untouched for over a week
+```
+
+Both skip finished tasks and both *include* `merged` — the state that rots while waiting on a
+human to accept it. Use these instead of eyeballing the whole board.
 
 ## The loop
 
