@@ -153,6 +153,36 @@ fn render(command: &str, data: Option<&serde_json::Value>) -> String {
     format!("{}: {}\n", command, summary_line(data))
 }
 
+/// Refuse an owner that is not registered, naming the ones that are.
+///
+/// Listing them matters more than it looks: `SKILL.md` is the always-loaded file and
+/// `reference.md` is explicitly not loaded until needed, so an agent whose first action is
+/// `task create` can hit this with no owner-registry guidance in its context at all. Putting the
+/// valid names in the message means the fix arrives where the caller already is — the same
+/// reasoning as `kind_message` below.
+fn require_owner(label: &str, root: &std::path::Path, name: &str) {
+    let owners = load_owners(root);
+    if owners.iter().any(|o| o.name == name) {
+        return;
+    }
+    let known: Vec<&str> = owners.iter().map(|o| o.name.as_str()).collect();
+    // An empty registry is the likeliest moment to hit this, and "registered owners are:" with
+    // nothing after it is worse than useless — name the command that fixes it instead.
+    let hint = if known.is_empty() {
+        "no owners are registered yet — add one with \
+         `taskforge owner add --name <you> --type human`"
+            .to_string()
+    } else {
+        format!("registered owners are: {}", known.join(", "))
+    };
+    Envelope::err(
+        label,
+        "OWNER_NOT_FOUND",
+        format!("owner not in registry: {name}; {hint}"),
+    )
+    .emit()
+}
+
 /// An unknown-kind message that names the whole legal set, so the fix is in the error.
 fn kind_message(e: &taskforge_core::model::UnknownKind) -> String {
     let legal: Vec<&str> = TaskKind::ALL.iter().map(|k| k.as_str()).collect();
@@ -757,14 +787,7 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
                 Some(Err(e)) => Envelope::err(label, "INVALID_KIND", kind_message(&e)).emit(),
                 None => None,
             };
-            if !load_owners(root).iter().any(|o| o.name == owner) {
-                Envelope::err(
-                    label,
-                    "OWNER_NOT_FOUND",
-                    format!("owner not in registry: {owner}"),
-                )
-                .emit();
-            }
+            require_owner(label, root, &owner);
             // Validate the parent before minting an id, so a rejected create consumes nothing.
             if let Some(p) = &parent {
                 match store.get(p) {
@@ -956,26 +979,12 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
         ),
         TaskCmd::Assign { act, owner } => {
             let label = "task assign";
-            if !load_owners(root).iter().any(|o| o.name == owner) {
-                Envelope::err(
-                    label,
-                    "OWNER_NOT_FOUND",
-                    format!("owner not in registry: {owner}"),
-                )
-                .emit();
-            }
+            require_owner(label, root, &owner);
             patch(label, &mut store, &act, "assign", |t| t.owner = owner)
         }
         TaskCmd::SetReviewer { act, reviewer } => {
             let label = "task set-reviewer";
-            if !load_owners(root).iter().any(|o| o.name == reviewer) {
-                Envelope::err(
-                    label,
-                    "OWNER_NOT_FOUND",
-                    format!("owner not in registry: {reviewer}"),
-                )
-                .emit();
-            }
+            require_owner(label, root, &reviewer);
             patch(label, &mut store, &act, "set_reviewer", |t| {
                 t.reviewer = Some(reviewer)
             })

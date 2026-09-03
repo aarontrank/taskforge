@@ -89,6 +89,18 @@ taskforge task list --stale 7d --json     # untouched for over a week
 Both skip finished tasks and both *include* `merged` — the state that rots while waiting on a
 human to accept it. Use these instead of eyeballing the whole board.
 
+## Owners are a registry
+
+`--owner` and `--reviewer` must name an **already-registered** owner, or the command fails with
+`OWNER_NOT_FOUND`. The names are per-machine, so never assume one from an example — read them:
+
+```bash
+taskforge owner list --json
+taskforge owner add --name <name> --type human|agent --json   # if the one you need is missing
+```
+
+`--actor` is free text and needs no registration; it is only recorded in the audit log.
+
 ## The loop
 
 ```bash

@@ -2029,3 +2029,90 @@ fn stale_and_status_filters_compose() {
     );
     assert_eq!(ids(&v), vec![running], "{v}");
 }
+
+// ---------------------------------------------------------------------------
+// OWNER_NOT_FOUND names the valid owners, so the fix travels with the error.
+//
+// The reason this matters: SKILL.md is the always-loaded file and reference.md is explicitly
+// not loaded until needed, so an agent whose first action is `task create` can hit this with
+// no owner-registry guidance in its context at all. Naming the registered owners in the
+// message puts the answer where the caller already is — the same reasoning as INVALID_KIND
+// listing the legal kinds.
+// ---------------------------------------------------------------------------
+
+/// The error message from a command expected to fail.
+fn error_message(v: &serde_json::Value) -> String {
+    v["errors"][0]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn owner_not_found_names_the_registered_owners() {
+    let d = setup(); // registers "agent"
+    run(
+        d.path(),
+        &[
+            "owner", "add", "--name", "aaron", "--type", "human", "--json",
+        ],
+    );
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task", "create", "--title", "x", "--owner", "nobody", "--actor", "agent", "--json",
+        ],
+    );
+    assert!(!ok, "{v}");
+    assert_eq!(v["errors"][0]["code"], "OWNER_NOT_FOUND");
+    let msg = error_message(&v);
+    assert!(msg.contains("nobody"), "names the bad owner: {msg}");
+    for known in ["agent", "aaron"] {
+        assert!(
+            msg.contains(known),
+            "message must name registered owner {known:?}: {msg}"
+        );
+    }
+}
+
+#[test]
+fn owner_not_found_on_an_empty_registry_says_how_to_add_one() {
+    // "registered owners are: " with nothing after it would be worse than useless, and this is
+    // the state a brand-new store is in — the most likely moment to hit this error.
+    let d = tempfile::tempdir().unwrap();
+    run(d.path(), &["init", "--json"]);
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task", "create", "--title", "x", "--owner", "nobody", "--actor", "me", "--json",
+        ],
+    );
+    assert!(!ok, "{v}");
+    let msg = error_message(&v);
+    assert!(
+        msg.contains("owner add"),
+        "an empty registry gets the command that fixes it: {msg}"
+    );
+}
+
+#[test]
+fn assign_and_set_reviewer_name_the_registered_owners_too() {
+    // All three sites that validate an owner share one message, so none of them can drift.
+    let d = setup();
+    let id = mk(d.path(), "t");
+    for (cmd, flag) in [("assign", "--owner"), ("set-reviewer", "--reviewer")] {
+        let (ok, v) = run(
+            d.path(),
+            &[
+                "task", cmd, "--id", &id, flag, "nobody", "--actor", "agent", "--json",
+            ],
+        );
+        assert!(!ok, "{cmd}: {v}");
+        assert_eq!(v["errors"][0]["code"], "OWNER_NOT_FOUND", "{cmd}");
+        let msg = error_message(&v);
+        assert!(
+            msg.contains("agent"),
+            "{cmd} must name the registered owners: {msg}"
+        );
+    }
+}

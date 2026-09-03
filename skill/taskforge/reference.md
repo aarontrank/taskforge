@@ -281,7 +281,7 @@ date), `relative` (advance from completion time). Month arithmetic clamps to the
 | Code | Meaning |
 |---|---|
 | `TASK_NOT_FOUND` | No such task id |
-| `OWNER_NOT_FOUND` | Owner is not in the registry |
+| `OWNER_NOT_FOUND` | Owner is not in the registry. The message names the registered owners, or tells you how to add the first one |
 | `INVALID_STATUS_TRANSITION` | That move is not legal from the current status |
 | `BLOCKED_BY_OPEN_TASK` | A blocker is not `done`. The message names which |
 | `REVIEW_REQUIRED` | Cannot complete directly; request review instead |
