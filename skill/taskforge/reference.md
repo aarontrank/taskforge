@@ -199,6 +199,15 @@ Both filters **ignore the terminal statuses**. A task finished in January has no
 since, and that is correct rather than abandoned; surfacing it would bury the tasks that do need
 attention.
 
+### Date formats
+
+`--expected-by` and `--due-at` each take either `YYYY-MM-DD` — read as midnight UTC — or a full
+RFC3339 timestamp like `2026-09-08T17:00:00Z`. Anything else is refused with `INVALID_DATE`
+before the task is touched, and the message names both legal forms.
+
+Prefer the full timestamp when the hour matters: `--expected-by 2026-09-08` means the wait is
+overdue from `2026-09-09T00:00:00Z`, not at close of business on the 8th.
+
 `merged` is deliberately *not* ignored. It is the state that rots silently while waiting for a
 human to `accept`, so it is exactly what these queries are for.
 
@@ -292,6 +301,7 @@ date), `relative` (advance from completion time). Month arithmetic clamps to the
 | `INVALID_PARENT` | `--parent` names a task that is already a subtask; one level only |
 | `INVALID_KIND` | `--kind` is not one of the closed set; the message names the legal values |
 | `INVALID_AGE` | `--stale` could not be read as an age; try `12h`, `7d`, `2w`, or a number of days |
+| `INVALID_DATE` | `--expected-by` / `--due-at` is neither `YYYY-MM-DD` nor RFC3339. Refused before the task is touched, because a date no reader can parse makes the task invisible to `--overdue` rather than visibly wrong |
 | `OWNER_EXISTS` | Owner name already registered |
 | `IO_ERROR` | A write failed. **Nothing was stored** — the task is unchanged on disk, and any status or version in the response would have been a fiction, so none is returned |
 

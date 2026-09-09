@@ -185,9 +185,21 @@ pub fn parse_age(s: &str) -> Option<time::Duration> {
     })
 }
 
-/// Parse an RFC3339 timestamp, or `None` if the field is unreadable.
-fn timestamp(s: &str) -> Option<time::OffsetDateTime> {
-    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+/// Parse a stored date: a full RFC3339 instant, or a bare `YYYY-MM-DD` read as midnight UTC.
+///
+/// **Every reader and every write-side validator goes through this one function.** Two parsers
+/// is how this went wrong: the CLI stored whatever string it was handed while `is_overdue` and
+/// the recurrence arithmetic each demanded strict RFC3339 separately, so `--expected-by
+/// 2026-09-08` was accepted and then permanently invisible to `--overdue`. A value that fails
+/// here must be refused at the boundary rather than stored, because nothing downstream can
+/// distinguish "unreadable" from "not late".
+pub fn parse_date(s: &str) -> Option<time::OffsetDateTime> {
+    if let Ok(t) = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339) {
+        return Some(t);
+    }
+    let date_only = time::macros::format_description!("[year]-[month]-[day]");
+    let d = time::Date::parse(s, date_only).ok()?;
+    Some(d.midnight().assume_utc())
 }
 
 /// How a recurring task generates its next occurrence.
@@ -407,8 +419,8 @@ impl Task {
             return false;
         }
         match (
-            self.expected_by.as_deref().and_then(timestamp),
-            timestamp(now),
+            self.expected_by.as_deref().and_then(parse_date),
+            parse_date(now),
         ) {
             (Some(expected), Some(now)) => now > expected,
             // An unreadable date is not evidence of lateness.
@@ -426,7 +438,7 @@ impl Task {
         if self.status.is_terminal() {
             return false;
         }
-        match (timestamp(&self.updated_at), timestamp(now)) {
+        match (parse_date(&self.updated_at), parse_date(now)) {
             (Some(updated), Some(now)) => now - updated > max_age,
             _ => false,
         }
@@ -611,6 +623,31 @@ updated_at: 2026-09-03T00:00:00Z
     fn a_task_with_no_expected_by_is_never_overdue() {
         let mut t = Task::new("TASK-0001", "t", "main", "a", "2026-09-01T00:00:00Z");
         t.status = TaskStatus::InReview;
+        assert!(!t.is_overdue("2027-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn a_date_only_expected_by_is_read_as_midnight_utc() {
+        // The CLI accepts `--expected-by 2026-09-08` and stores it verbatim, so the reader has
+        // to understand what the writer was allowed to write. A strict RFC3339 parse made every
+        // such task permanently invisible to `--overdue` — the whole point of the query.
+        let mut t = Task::new("TASK-0001", "t", "main", "a", "2026-09-01T00:00:00Z");
+        t.status = TaskStatus::InReview;
+        t.expected_by = Some("2026-09-08".into());
+        assert!(t.is_overdue("2026-09-09T00:00:00Z"), "the day has passed");
+        assert!(
+            !t.is_overdue("2026-09-08T00:00:00Z"),
+            "midnight itself is the start of the window, not past it"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_expected_by_is_still_not_evidence_of_lateness() {
+        // Leniency stops at the two forms a caller can actually write. Anything else stays
+        // "unknown", never "late".
+        let mut t = Task::new("TASK-0001", "t", "main", "a", "2026-09-01T00:00:00Z");
+        t.status = TaskStatus::InReview;
+        t.expected_by = Some("next tuesday".into());
         assert!(!t.is_overdue("2027-01-01T00:00:00Z"));
     }
 

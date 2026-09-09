@@ -2116,3 +2116,105 @@ fn assign_and_set_reviewer_name_the_registered_owners_too() {
         );
     }
 }
+
+#[test]
+fn a_date_only_expected_by_is_accepted_and_stored() {
+    // The lenient form callers already use. Validation must not become a wall in front of it.
+    let d = setup();
+    let id = mk(d.path(), "t");
+    let (ok, v) = run(
+        d.path(),
+        &[
+            "task",
+            "set-review",
+            "--id",
+            &id,
+            "--expected-by",
+            "2026-09-08",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    assert!(ok, "a bare date is a legal expected-by: {v}");
+    assert_eq!(v["data"]["expected_by"], "2026-09-08");
+}
+
+#[test]
+fn an_unreadable_date_is_refused_by_every_command_that_takes_one() {
+    // One shared validator, so no date-taking flag can drift back to storing anything at all.
+    // The failure this prevents: a value written here that no reader can parse, which makes the
+    // task silently invisible to `--overdue` rather than loudly wrong.
+    let d = setup();
+    for (cmd, flag) in [("set-review", "--expected-by"), ("set-due", "--due-at")] {
+        let id = mk(d.path(), "t");
+        let (ok, v) = run(
+            d.path(),
+            &[
+                "task",
+                cmd,
+                "--id",
+                &id,
+                flag,
+                "next tuesday",
+                "--actor",
+                "agent",
+                "--json",
+            ],
+        );
+        assert!(!ok, "{cmd} must refuse an unreadable date: {v}");
+        assert_eq!(v["errors"][0]["code"], "INVALID_DATE", "{cmd}");
+        let msg = error_message(&v);
+        assert!(
+            msg.contains("2026-09-08") || msg.contains("YYYY-MM-DD"),
+            "{cmd} must show the legal form: {msg}"
+        );
+    }
+}
+
+#[test]
+fn a_refused_date_leaves_the_task_untouched() {
+    // Validated before anything is written, the same rule `--kind` follows: a bad value creates
+    // no half-applied task.
+    let d = setup();
+    let id = mk(d.path(), "t");
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-review",
+            "--id",
+            &id,
+            "--review-id",
+            "CR-1",
+            "--expected-by",
+            "2026-09-08",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    let (_, before) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    run(
+        d.path(),
+        &[
+            "task",
+            "set-review",
+            "--id",
+            &id,
+            "--review-id",
+            "CR-2",
+            "--expected-by",
+            "garbage",
+            "--actor",
+            "agent",
+            "--json",
+        ],
+    );
+    let (_, after) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    assert_eq!(
+        before["data"]["reviews"], after["data"]["reviews"],
+        "the review must not be replaced when the date alongside it is refused"
+    );
+    assert_eq!(before["data"]["version"], after["data"]["version"]);
+}

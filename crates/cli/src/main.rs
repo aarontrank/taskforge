@@ -183,6 +183,28 @@ fn require_owner(label: &str, root: &std::path::Path, name: &str) {
     .emit()
 }
 
+/// Refuse a date no reader could parse, before anything is written.
+///
+/// The write side and `model::parse_date` are deliberately the *same* predicate. When they were
+/// two, `--expected-by 2026-09-08` was accepted and stored, and then `--overdue` — which parsed
+/// strict RFC3339 — matched nothing, because an unreadable date cannot be told apart from a task
+/// that is not late. That failure is silent by construction, so it has to be caught here.
+fn require_date(label: &str, flag: &str, value: Option<&String>) {
+    let Some(v) = value else { return };
+    if taskforge_core::model::parse_date(v).is_some() {
+        return;
+    }
+    Envelope::err(
+        label,
+        "INVALID_DATE",
+        format!(
+            "cannot read {v:?} as a date for {flag}; expected YYYY-MM-DD (e.g. 2026-09-08) or a \
+             full RFC3339 timestamp (e.g. 2026-09-08T17:00:00Z)"
+        ),
+    )
+    .emit()
+}
+
 /// An unknown-kind message that names the whole legal set, so the fix is in the error.
 fn kind_message(e: &taskforge_core::model::UnknownKind) -> String {
     let legal: Vec<&str> = TaskKind::ALL.iter().map(|k| k.as_str()).collect();
@@ -905,6 +927,9 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             review_id,
             expected_by,
         } => {
+            // Checked before anything is written, so a bad date does not land a half-applied
+            // change that replaced the review id and skipped the window.
+            require_date("task set-review", "--expected-by", expected_by.as_ref());
             // An absent flag leaves its own field alone, so one can be set without clearing
             // the other.
             patch("task set-review", &mut store, &act, "set_review", |t| {
@@ -990,6 +1015,7 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             })
         }
         TaskCmd::SetDue { act, due_at } => {
+            require_date("task set-due", "--due-at", Some(&due_at));
             patch("task set-due", &mut store, &act, "set_due", |t| {
                 t.due_at = Some(due_at)
             })

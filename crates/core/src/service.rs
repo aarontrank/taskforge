@@ -274,7 +274,7 @@ impl<S: TaskStore> TaskService<S> {
     }
 }
 
-/// Add `interval` periods of `frequency` to an RFC3339 timestamp.
+/// Add `interval` periods of `frequency` to a stored date.
 ///
 /// Month arithmetic clamps to the last valid day of the target month: 31 January plus one
 /// month is 28 February, not 3 March. JavaScript's `setMonth` overflows instead, so this is a
@@ -282,7 +282,10 @@ impl<S: TaskStore> TaskService<S> {
 /// a worse answer for a recurring task than landing on its final day.
 fn advance(ts: &str, freq: RecurrenceFrequency, interval: u32) -> Option<String> {
     use time::format_description::well_known::Rfc3339;
-    let start = time::OffsetDateTime::parse(ts, &Rfc3339).ok()?;
+    // `parse_date`, not a second strict parse: `set-due` accepts a bare date, and a parser here
+    // that could not read one turned it into "no next due date", which is indistinguishable
+    // from a correctly-undated occurrence.
+    let start = crate::model::parse_date(ts)?;
     let n = interval as i64;
     let moved = match freq {
         RecurrenceFrequency::Hourly => start.checked_add(time::Duration::hours(n))?,
@@ -604,6 +607,30 @@ mod tests {
             .unwrap();
         let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
         assert_eq!(n.due_at.as_deref(), Some("2026-09-02T08:00:00Z"));
+    }
+
+    #[test]
+    fn a_date_only_due_date_advances_instead_of_being_dropped() {
+        // `task set-due 2026-09-01` is accepted, so the recurrence has to be able to read it
+        // back. A strict RFC3339 parse silently returned no next due date, which looks exactly
+        // like a correctly-undated occurrence.
+        let mut s = svc();
+        s.store
+            .put(recurring(
+                "TASK-0001",
+                RecurrenceFrequency::Daily,
+                Some("2026-09-01"),
+                DueStrategy::Absolute,
+            ))
+            .unwrap();
+        s.set_status("TASK-0001", TaskStatus::Done, "a", None)
+            .unwrap();
+        let n = s.store.get(&s.last_generated.clone().unwrap()).unwrap();
+        assert_eq!(
+            n.due_at.as_deref(),
+            Some("2026-09-02T00:00:00Z"),
+            "read as midnight UTC, advanced, and written back in full"
+        );
     }
 
     #[test]
