@@ -40,8 +40,20 @@ fn mentions_token(haystack: &str, token: &str) -> bool {
 
 /// Every `task` subcommand the binary exposes, from its own `--help`.
 fn real_commands() -> Vec<String> {
+    subcommands_of(&["task", "--help"])
+}
+
+/// Top-level commands: `init`, `owner`, `task`, `workspace`, `doctor`.
+///
+/// Checked separately because `real_commands` only reads `task --help`, so for the whole life of
+/// this crate every top-level command has been exempt from the documentation test by accident.
+fn top_level_commands() -> Vec<String> {
+    subcommands_of(&["--help"])
+}
+
+fn subcommands_of(args: &[&str]) -> Vec<String> {
     let out = Command::new(env!("CARGO_BIN_EXE_taskforge"))
-        .args(["task", "--help"])
+        .args(args)
         .output()
         .expect("binary runs");
     String::from_utf8_lossy(&out.stdout)
@@ -155,6 +167,19 @@ fn every_command_the_binary_has_is_named_in_the_reference() {
 }
 
 #[test]
+fn every_top_level_command_is_named_in_the_reference_too() {
+    let reference = doc("reference.md");
+    let undocumented: Vec<String> = top_level_commands()
+        .into_iter()
+        .filter(|c| !mentions_token(&reference, &format!("taskforge {c}")))
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "top-level commands reference.md never mentions: {undocumented:?}"
+    );
+}
+
+#[test]
 fn every_code_the_cli_can_emit_is_documented() {
     // Sourced from main.rs rather than from a hand-kept list, so a new code added without a doc
     // entry fails here instead of shipping undocumented.
@@ -164,6 +189,20 @@ fn every_code_the_cli_can_emit_is_documented() {
     .expect("reading main.rs");
     let reference = doc("reference.md");
 
+    // Environment-variable names look exactly like response codes and are not response codes.
+    // Derived from the source instead of a hand-kept allowlist: the allowlist version failed the
+    // first time a new `env!` was added, which is the same "someone has to remember" that this
+    // whole test exists to remove.
+    let env_names: BTreeSet<&str> = ["env!(\"", "env::var(\""]
+        .iter()
+        .flat_map(|pat| {
+            source.match_indices(pat).filter_map(|(i, m)| {
+                let rest = &source[i + m.len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+        })
+        .collect();
+
     let mut missing = Vec::new();
     for raw in source.split('"').skip(1).step_by(2) {
         let is_code = raw.len() > 3
@@ -171,11 +210,7 @@ fn every_code_the_cli_can_emit_is_documented() {
                 .chars()
                 .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
             && raw.contains('_');
-        // Env-var and build-time macro names are not response codes.
-        if is_code
-            && !matches!(raw, "CARGO_PKG_VERSION" | "TASKFORGE_ROOT")
-            && !mentions_token(&reference, raw)
-        {
+        if is_code && !env_names.contains(raw) && !mentions_token(&reference, raw) {
             missing.push(raw.to_string());
         }
     }

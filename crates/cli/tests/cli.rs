@@ -2218,3 +2218,85 @@ fn a_refused_date_leaves_the_task_untouched() {
     );
     assert_eq!(before["data"]["version"], after["data"]["version"]);
 }
+
+/// Raw runner for output that is not the JSON envelope — `--version` is clap's, not ours.
+fn run_raw(args: &[&str]) -> (bool, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_taskforge"))
+        .args(args)
+        .output()
+        .expect("binary runs");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+    )
+}
+
+#[test]
+fn version_names_the_commit_it_was_built_from() {
+    // A bare semver cannot distinguish an installed binary from repo HEAD, which is how a week's
+    // worth of committed features stayed unreachable without anything reporting it.
+    let (ok, out) = run_raw(&["--version"]);
+    assert!(ok, "--version succeeds: {out}");
+    let commit = out
+        .split('(')
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(commit.len(), 7, "a 7-char short sha, got {out:?}");
+    assert!(
+        commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "the parenthesised part must be a sha: {out:?}"
+    );
+}
+
+#[test]
+fn the_envelope_version_stays_a_bare_semver() {
+    // `taskforge_version` is a published contract. An agent comparing it against a number should
+    // not have to strip a commit suffix, so the commit goes in `--version` and `doctor` only.
+    let d = setup();
+    let (_, v) = run(d.path(), &["task", "list", "--json"]);
+    let ver = v["taskforge_version"].as_str().unwrap();
+    assert!(
+        !ver.contains('(') && ver.split('.').count() == 3,
+        "expected a bare x.y.z, got {ver:?}"
+    );
+}
+
+#[test]
+fn doctor_reports_this_test_binary_as_fresh() {
+    // Built from the checkout it is now comparing against, so the only honest answer is fresh.
+    // The stale verdict cannot be produced this way — a test cannot build a binary from a commit
+    // that does not exist yet — which is why `freshness` is a pure function tested separately.
+    let d = setup();
+    let (ok, v) = run(d.path(), &["doctor", "--json"]);
+    assert!(ok, "fresh must exit 0: {v}");
+    assert_eq!(v["data"]["state"], "fresh", "{v}");
+    assert_eq!(
+        v["data"]["binary"]["commit"], v["data"]["source"]["commit"],
+        "fresh means the two commits agree: {v}"
+    );
+}
+
+#[test]
+fn doctor_reports_where_the_source_is_and_when_the_binary_was_built() {
+    // Without these a stale verdict is a dead end: you know something is wrong and not which
+    // checkout to reinstall from.
+    let d = setup();
+    let (_, v) = run(d.path(), &["doctor", "--json"]);
+    assert!(
+        v["data"]["source"]["dir"].as_str().unwrap().contains('/'),
+        "a real path: {v}"
+    );
+    assert!(
+        v["data"]["binary"]["built_at"]
+            .as_str()
+            .unwrap()
+            .starts_with("20"),
+        "an RFC3339 timestamp: {v}"
+    );
+    assert_eq!(
+        v["data"]["source"]["version"], v["data"]["binary"]["version"],
+        "a fresh build's two versions agree: {v}"
+    );
+}

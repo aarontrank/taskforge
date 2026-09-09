@@ -57,6 +57,30 @@ cargo install --path crates/cli     # puts `taskforge` on your PATH
 Re-run that same command after pulling changes; it overwrites in place. To remove the binary
 later: `cargo uninstall taskforge-cli`.
 
+### Is the installed binary current?
+
+```bash
+taskforge --version      # 0.3.0 (60610a0) — semver plus the commit it was built from
+taskforge doctor         # compares that commit against this checkout; exit 1 if stale
+```
+
+Worth the two commands, because forgetting the reinstall is not a hypothetical: the installed
+binary once sat **eight commits behind** for a week. `kind`, `--stale` and `--overdue` were
+written, tested and committed, and none of them had ever run — while `--version` reported `0.2.0`
+for both builds, so nothing could say so. `doctor` is the answer to "is this flag missing, or is
+my install old?", which is otherwise a question you have to already suspect to ask.
+
+### Releasing
+
+**Bump `version` in the workspace `Cargo.toml` in the same commit as the change.** Pre-1.0: minor
+for anything that adds or changes a command or its output, patch for a fix. The number is what
+makes a build *nameable* in a bug report.
+
+It is not, however, what makes drift *detectable* — a version only moves when someone remembers
+to move it, and forgetting is what caused the incident above. That is why the commit is baked in
+at build time (`crates/cli/build.rs`): the hash cannot be forgotten, so `doctor` still gives a
+true answer on a release where the bump was missed.
+
 `cargo install` refreshes the crates.io index, so it needs network even when every dependency is
 already cached — offline or in a sandbox it fails with `Could not resolve host: index.crates.io`.
 Add `--locked --offline` there and it builds from the committed lockfile.
@@ -257,13 +281,13 @@ The Rust implementation is the only implementation; the earlier TypeScript versi
 Next.js web UI have been removed. Human inspection is the markdown files themselves plus
 `taskforge task list`.
 
-`157` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
+`177` tests cover the model, the full transition matrix (all 121 state pairs), the workflow
 guards, filesystem round-trips, hook execution including timeouts, and the CLI end to end —
 including a test that every one of the eleven statuses is reachable through the binary, and
 tests that drive the write path against an unwritable file so a refused write cannot regress
 into being reported as a success.
 
-Six of them check the **skill docs** rather than the code (`crates/cli/tests/docs.rs`). An agent
+Seven of them check the **skill docs** rather than the code (`crates/cli/tests/docs.rs`). An agent
 learns this tool by reading `skill/taskforge/`, so a wrong claim there misleads it exactly as a
 bug would, and silently. The transition table in `reference.md` is parsed and diffed against
 `can_transition`; every documented flag is checked against that command's `--help`; every

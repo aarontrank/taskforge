@@ -64,6 +64,28 @@ taskforge workspace list --json
 Owners are validated: `--owner` and `--reviewer` must name a registered owner, or the command
 fails with `OWNER_NOT_FOUND`.
 
+## Is this binary current?
+
+```bash
+taskforge --version                       # 0.3.0 (60610a0) — semver plus the commit it was built from
+taskforge doctor --json                   # compares that commit against its source checkout
+```
+
+`doctor` reports `state` as one of:
+
+| `state` | Meaning | Exit |
+|---|---|---|
+| `fresh` | The binary was built from the checkout's current HEAD | 0 |
+| `stale` | The source has moved since this binary was built. `note` carries the reinstall command and `behind` the commit count when it can be counted | 1 |
+| `unknown` | Built outside a git checkout, or the source is gone. Nothing can be concluded, which is not the same as "fine" | 0 |
+
+Only `stale` exits non-zero, so `doctor` can gate a script.
+
+**Run this before trusting that a flag is missing.** A command erroring with *unexpected argument*
+is far more often a stale install than a flag that does not exist: `--stale`, `--overdue` and
+`--kind` were committed, tested, and unreachable for a week because the installed binary predated
+them and `--version` reported the same number either way. `doctor` is the one-command answer.
+
 ## Creating and reading
 
 ```bash

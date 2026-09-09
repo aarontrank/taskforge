@@ -19,6 +19,23 @@ use taskforge_core::store::{AuditEntry, TaskStore};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Provenance baked in by `build.rs`. See that file for why the commit is not optional decoration.
+const GIT_COMMIT: &str = env!("TASKFORGE_GIT_COMMIT");
+const SOURCE_DIR: &str = env!("TASKFORGE_SOURCE_DIR");
+const BUILD_EPOCH: &str = env!("TASKFORGE_BUILD_EPOCH");
+
+/// What `--version` prints: `0.3.0 (60610a0)`.
+///
+/// The envelope's `taskforge_version` deliberately stays the bare semver — it is a published
+/// contract and an agent comparing it against a number should not have to strip a suffix. The
+/// commit belongs where a human is looking.
+const VERSION_WITH_COMMIT: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("TASKFORGE_GIT_COMMIT"),
+    ")"
+);
+
 /// Whether to print the JSON envelope. Set once from the parsed flags before anything is
 /// emitted; a global because `emit()` is reached from dozens of places and threading a flag
 /// through every one of them would obscure the code paths it is meant to decorate.
@@ -336,7 +353,7 @@ fn str_of_raw(v: &serde_json::Value) -> String {
 }
 
 #[derive(Parser)]
-#[command(name = "taskforge", version = VERSION, about = "Local task management for one human and many agents")]
+#[command(name = "taskforge", version = VERSION_WITH_COMMIT, about = "Local task management for one human and many agents")]
 struct Cli {
     /// Repository root. Defaults to $TASKFORGE_ROOT, else ~/.taskforge.
     #[arg(long, global = true)]
@@ -370,6 +387,47 @@ enum Top {
         #[command(subcommand)]
         command: WorkspaceCmd,
     },
+    /// Report whether this binary is built from the current source, and how to fix it if not.
+    Doctor,
+}
+
+/// How the running binary relates to the checkout it was built from.
+#[derive(Debug, PartialEq, Eq)]
+enum Freshness {
+    Fresh,
+    /// `behind` is `None` when the distance cannot be counted — see the tests.
+    Stale {
+        behind: Option<u32>,
+    },
+    /// Nothing can be concluded, and saying so is the point. The alternative is calling an
+    /// unknown state "fresh", which is the reassuring answer and the wrong one.
+    Unknown(&'static str),
+}
+
+/// Compare the commit baked into this binary against the checkout's current HEAD.
+///
+/// Pure, and separated from the `git` calls that feed it, because the interesting case — a stale
+/// binary — cannot be produced by a test that runs the binary it just built. The IO shell is
+/// `doctor` below; everything worth asserting is here.
+fn freshness(baked: &str, source_head: Option<&str>, behind: Option<u32>) -> Freshness {
+    if baked == "unknown" {
+        return Freshness::Unknown("this binary was built outside a git checkout");
+    }
+    match source_head {
+        None => Freshness::Unknown("the source checkout is missing or not a git repository"),
+        Some(head) if head == baked => Freshness::Fresh,
+        Some(_) => Freshness::Stale { behind },
+    }
+}
+
+/// Exit status for a verdict. Only staleness fails, so `doctor` can gate a script; `Unknown` is
+/// not a failure because "cannot tell" is not the same as "wrong", and a release build with no
+/// `.git` would otherwise fail forever.
+fn exit_code(f: &Freshness) -> i32 {
+    match f {
+        Freshness::Stale { .. } => 1,
+        Freshness::Fresh | Freshness::Unknown(_) => 0,
+    }
 }
 
 #[derive(Subcommand)]
@@ -781,7 +839,141 @@ fn main() {
                 Envelope::ok("workspace list", serde_json::json!(names)).emit()
             }
         },
+        Top::Doctor => doctor(),
     }
+}
+
+/// Report whether the running binary matches its source checkout.
+///
+/// The IO shell around `freshness`: read the checkout's HEAD, count the distance, and render.
+/// Deliberately not run automatically on every command — taskforge is called in agent loops, and
+/// a `git` subprocess per invocation is a real cost to pay for a check that changes daily at most.
+fn doctor() -> ! {
+    let label = "doctor";
+    let source_head = git_in(SOURCE_DIR, &["rev-parse", "--short=7", "HEAD"]);
+    // Counting fails when the baked commit is not an ancestor of HEAD — after a rebase, or a
+    // checkout of an unrelated branch. That is still stale, just of unknown distance.
+    let behind = git_in(
+        SOURCE_DIR,
+        &["rev-list", "--count", &format!("{GIT_COMMIT}..HEAD")],
+    )
+    .and_then(|s| s.parse::<u32>().ok());
+    let verdict = freshness(GIT_COMMIT, source_head.as_deref(), behind);
+
+    let (state, note) = match &verdict {
+        Freshness::Fresh => (
+            "fresh",
+            "this binary is built from the current source".to_string(),
+        ),
+        Freshness::Stale { behind } => (
+            "stale",
+            match behind {
+                Some(n) => format!(
+                    "the source is {n} commit{} ahead — reinstall with \
+                     `cargo install --locked --path crates/cli`",
+                    if *n == 1 { "" } else { "s" }
+                ),
+                None => "the source has moved and this build is not on it — reinstall with \
+                         `cargo install --locked --path crates/cli`"
+                    .to_string(),
+            },
+        ),
+        Freshness::Unknown(why) => ("unknown", (*why).to_string()),
+    };
+
+    let data = serde_json::json!({
+        "state": state,
+        "note": note,
+        "binary": {
+            "version": VERSION,
+            "commit": GIT_COMMIT,
+            "built_at": build_time(),
+        },
+        "source": {
+            "dir": SOURCE_DIR,
+            "commit": source_head,
+            "version": source_version(),
+        },
+        "behind": behind,
+    });
+
+    // Not the usual `Envelope::ok`/`err` split: staleness is a true report, not a failed command,
+    // so `ok` stays true while the exit status still carries the verdict for a gate to read.
+    let env = Envelope::ok(label, data);
+    if JSON_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        println!("{}", serde_json::to_string_pretty(&env).unwrap_or_default());
+    } else {
+        println!(
+            "  binary   {VERSION} ({GIT_COMMIT})  built {}",
+            build_time()
+        );
+        println!(
+            "  source   {}  ({})",
+            source_version().unwrap_or_else(|| "?".into()),
+            source_head.as_deref().unwrap_or("?")
+        );
+        println!("  {}: {note}", state.to_uppercase());
+    }
+    std::process::exit(exit_code(&verdict))
+}
+
+/// Run git inside a directory, or `None` if git is absent, the directory is gone, or it failed.
+fn git_in(dir: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// The build timestamp, formatted from the epoch seconds `build.rs` baked in.
+fn build_time() -> String {
+    BUILD_EPOCH
+        .parse::<i64>()
+        .ok()
+        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// The version currently declared in the source workspace manifest.
+///
+/// A line scan rather than a TOML parse: one field this project owns is not worth a dependency,
+/// and a wrong answer here is cosmetic — the commit comparison is what decides the verdict.
+fn source_version() -> Option<String> {
+    let manifest =
+        std::fs::read_to_string(std::path::Path::new(SOURCE_DIR).join("Cargo.toml")).ok()?;
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[workspace.package]";
+            continue;
+        }
+        if in_package {
+            if let Some(v) = line.strip_prefix("version") {
+                return Some(
+                    v.trim_start_matches([' ', '='])
+                        .trim()
+                        .trim_matches('"')
+                        .to_string(),
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Turn a domain error into the envelope, preserving its stable code.
@@ -1341,5 +1533,65 @@ fn audit_warning(
             "AUDIT_WRITE_FAILED",
             format!("{id} was changed but the audit entry was not written: {e}"),
         )],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_binary_built_from_the_current_head_is_fresh() {
+        assert_eq!(
+            freshness("60610a0", Some("60610a0"), None),
+            Freshness::Fresh
+        );
+    }
+
+    #[test]
+    fn a_binary_built_from_an_older_commit_is_stale() {
+        assert_eq!(
+            freshness("42471d8", Some("60610a0"), Some(3)),
+            Freshness::Stale { behind: Some(3) }
+        );
+    }
+
+    #[test]
+    fn staleness_is_reported_even_when_the_distance_cannot_be_counted() {
+        // A rebase or a force-push leaves the baked commit unreachable from HEAD, so
+        // `rev-list --count` fails. Not knowing *how far* behind is no reason to stop
+        // reporting *that* it is behind — that silence is the whole bug this detects.
+        assert_eq!(
+            freshness("deadbee", Some("60610a0"), None),
+            Freshness::Stale { behind: None }
+        );
+    }
+
+    #[test]
+    fn a_binary_built_outside_a_git_checkout_reports_unknown_rather_than_fresh() {
+        // `cargo install` from a published crate or a tarball has no commit to bake. Calling
+        // that "fresh" would be a comforting lie.
+        assert!(matches!(
+            freshness("unknown", Some("60610a0"), None),
+            Freshness::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_source_checkout_reports_unknown_rather_than_fresh() {
+        // The checkout was moved or deleted after installing. Nothing can be concluded.
+        assert!(matches!(
+            freshness("60610a0", None, None),
+            Freshness::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn only_staleness_is_a_failure_exit() {
+        // `doctor` is meant to be usable as a gate, so the exit status has to carry the verdict.
+        assert_eq!(exit_code(&Freshness::Fresh), 0);
+        assert_eq!(exit_code(&Freshness::Unknown("x")), 0);
+        assert_eq!(exit_code(&Freshness::Stale { behind: Some(1) }), 1);
+        assert_eq!(exit_code(&Freshness::Stale { behind: None }), 1);
     }
 }

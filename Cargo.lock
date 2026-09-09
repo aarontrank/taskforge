@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "taskforge-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "serde",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "taskforge-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",

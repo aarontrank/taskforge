@@ -89,6 +89,16 @@ taskforge task list --stale 7d --json     # untouched for over a week
 Both skip finished tasks and both *include* `merged` — the state that rots while waiting on a
 human to accept it. Use these instead of eyeballing the whole board.
 
+If either of those errors with *unexpected argument*, **do not conclude the flag does not exist**:
+
+```bash
+taskforge doctor --json                   # state: fresh | stale | unknown
+```
+
+`stale` means the installed binary predates the source and `note` carries the reinstall command.
+These two flags shipped and then sat unreachable for a week for exactly that reason, while
+`--version` reported the same number for both builds. One command settles it.
+
 ## Owners are a registry
 
 `--owner` and `--reviewer` must name an **already-registered** owner, or the command fails with
