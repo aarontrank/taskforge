@@ -96,10 +96,17 @@ reportable as such, whereas a wrong kind is a wrong number in a report nobody wi
 When more than one agent may touch a task, pass the version you read. This works on **every**
 mutating command — the status transitions and the field setters alike:
 
+**Re-read the version before every mutation.** Each one bumps it, so reusing a captured value for
+a second command is guaranteed to fail with `CONFLICT_VERSION_MISMATCH`.
+
 ```bash
-v=$(taskforge task show --id TASK-0001 --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["version"])')
-taskforge task start      --id TASK-0001 --actor agent --version "$v" --json
-taskforge task set-worker --id TASK-0001 --worker w1 --actor agent --version "$v" --json
+read_version() {
+  taskforge task show --id "$1" --json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["version"])'
+}
+
+taskforge task start      --id TASK-0001 --actor agent --version "$(read_version TASK-0001)" --json
+taskforge task set-worker --id TASK-0001 --worker w1 --actor agent --version "$(read_version TASK-0001)" --json
 ```
 
 On `CONFLICT_VERSION_MISMATCH`, re-read and decide whether the action still applies. Do not

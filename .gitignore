@@ -18,3 +18,7 @@
 # Investigation notebook
 .investigations/
 .plans/
+
+# Coverage output. The instrumented test binaries write these to the current directory, so
+# running one by hand from the package root drops them here rather than under build/.
+*.profraw

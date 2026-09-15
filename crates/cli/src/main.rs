@@ -122,6 +122,13 @@ impl Envelope {
             );
         } else if self.ok {
             print!("{}", render(&self.command, self.data.as_ref()));
+            // Warnings are the "committed, but something after it did not" cases — a hook that
+            // failed, an audit line that was not written. Dropping them in text mode showed a
+            // human unqualified success, which is the one thing `warnings` exists to prevent.
+            // On stderr, so stdout stays parseable in either mode.
+            for w in &self.warnings {
+                eprintln!("warning: {}: {}", w.code, w.message);
+            }
         } else {
             for e in &self.errors {
                 eprintln!("error: {}: {}", e.code, e.message);
@@ -762,10 +769,16 @@ fn main() {
             let label = "init";
             match store.init() {
                 Ok(()) => {
-                    let _ = std::fs::write(
-                        root.join("config.json"),
-                        "{\"default_workspace\":\"main\",\"hooks\":[]}\n",
-                    );
+                    // Guarded like owners.json below, and for the same reason: `init` is
+                    // documented as idempotent, and an unconditional write threw away every
+                    // configured hook on a second run.
+                    let config = root.join("config.json");
+                    if !config.exists() {
+                        let _ = std::fs::write(
+                            config,
+                            "{\"default_workspace\":\"main\",\"hooks\":[]}\n",
+                        );
+                    }
                     if !owners_path(&root).exists() {
                         let _ = std::fs::write(owners_path(&root), "[]\n");
                     }
@@ -1048,6 +1061,18 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
             let label = "task show";
             match store.get(&id) {
                 Some(t) => Envelope::ok(label, serde_json::to_value(t).unwrap_or_default()).emit(),
+                // "Not there" and "there but unreadable" are different problems with different
+                // fixes, and `get` cannot tell them apart — so ask the store which it is rather
+                // than reporting a file that exists as missing.
+                None if store.unreadable_ids().contains(&id) => Envelope::err(
+                    label,
+                    "TASK_UNREADABLE",
+                    format!(
+                        "{id} exists but its task.md cannot be read; \
+                         check its status and kind against this build"
+                    ),
+                )
+                .emit(),
                 None => fail(label, TaskError::NotFound(id)),
             }
         }
@@ -1088,7 +1113,24 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
                 }
             }
             tasks.sort_by(|a, b| a.id.cmp(&b.id));
-            Envelope::ok(label, serde_json::to_value(tasks).unwrap_or_default()).emit()
+            // A task whose file cannot be parsed is absent from `tasks` and would otherwise be
+            // absent from the output too — the failure mode being that a task silently disappears
+            // from the board. Named as a warning so the list still works and the gap is visible.
+            let unreadable = store.unreadable_ids();
+            let warnings = if unreadable.is_empty() {
+                Vec::new()
+            } else {
+                vec![Message::new(
+                    "TASK_UNREADABLE",
+                    format!(
+                        "not listed because their task.md cannot be read: {}",
+                        unreadable.join(", ")
+                    ),
+                )]
+            };
+            Envelope::ok(label, serde_json::to_value(tasks).unwrap_or_default())
+                .warn(warnings)
+                .emit()
         }
 
         TaskCmd::Start(a) => transition("task start", store, root, a, TaskStatus::Running),
@@ -1428,8 +1470,23 @@ fn post_commit_warnings<S: TaskStore>(svc: &TaskService<S>) -> Vec<Message> {
 
 /// Record an attachment or artifact reference on a task.
 fn attach(label: &str, store: &mut FsStore, f: FileRef, kind: &str) -> ! {
-    if store.get(&f.id).is_none() {
+    let Some(task) = store.get(&f.id) else {
         fail(label, TaskError::NotFound(f.id));
+    };
+    // The version guard runs BEFORE the copy. `patch` checks it again below, but by then the
+    // bytes are already in the task folder, so a refused attach left an orphaned file with
+    // nothing on the task referring to it.
+    if let Some(expected) = f.version {
+        if expected != task.version {
+            fail(
+                label,
+                TaskError::VersionMismatch {
+                    id: f.id.clone(),
+                    expected,
+                    actual: task.version,
+                },
+            );
+        }
     }
     let code = if kind == "attachments" {
         "ATTACHMENT_NOT_FOUND"

@@ -2300,3 +2300,164 @@ fn doctor_reports_where_the_source_is_and_when_the_binary_was_built() {
         "a fresh build's two versions agree: {v}"
     );
 }
+
+/// Run the binary and return (success, stdout, stderr). Text-mode output goes to both streams, so
+/// a test about what a *human* sees cannot use the JSON-only helpers above.
+fn run_streams(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_taskforge"))
+        .args(args)
+        .env("TASKFORGE_ROOT", root)
+        .output()
+        .expect("binary runs");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn re_running_init_keeps_a_configured_hook() {
+    // `init` is documented as idempotent and safe to re-run, but it wrote config.json
+    // unconditionally while owners.json beside it was guarded — so a second init silently threw
+    // away every configured notification.
+    let d = tempfile::tempdir().unwrap();
+    let (ok, _) = run(d.path(), &["init", "--json"]);
+    assert!(ok, "first init");
+    let config = d.path().join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"default_workspace":"main","hooks":[{"id":"notify","event":"task.status_changed","command":"true"}]}"#,
+    )
+    .unwrap();
+
+    let (ok, _) = run(d.path(), &["init", "--json"]);
+    assert!(ok, "second init");
+    let after = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        after.contains("notify"),
+        "re-running init must not discard configured hooks, got: {after}"
+    );
+}
+
+#[test]
+fn a_stale_version_on_attach_leaves_no_copied_file_behind() {
+    // The copy happened before the optimistic-concurrency check, so a refused attach still left
+    // the file in attachments/ with nothing on the task referring to it.
+    let d = setup();
+    let id = mk(d.path(), "with files");
+    let src = d.path().join("spec.txt");
+    std::fs::write(&src, "hello").unwrap();
+
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task",
+            "add-attachment",
+            "--id",
+            &id,
+            "--path",
+            src.to_str().unwrap(),
+            "--mode",
+            "copy",
+            "--actor",
+            "agent",
+            "--version",
+            "99",
+            "--json",
+        ],
+    );
+    assert!(!ok, "a stale version must be refused: {r}");
+    assert_eq!(r["errors"][0]["code"], "CONFLICT_VERSION_MISMATCH", "{r}");
+    let copied = d
+        .path()
+        .join("workspaces/main/tasks")
+        .join(&id)
+        .join("attachments/spec.txt");
+    assert!(
+        !copied.exists(),
+        "a refused attach must not leave the file behind at {}",
+        copied.display()
+    );
+}
+
+#[test]
+fn a_post_commit_warning_is_visible_without_json() {
+    // `warnings` exists to report "the change committed but something after it did not". In text
+    // mode emit() printed only the rendering and dropped them, so a human saw unqualified success.
+    let d = setup();
+    std::fs::write(
+        d.path().join("config.json"),
+        r#"{"default_workspace":"main","hooks":[{"id":"boom","event":"task.status_changed","command":"false"}]}"#,
+    )
+    .unwrap();
+    let id = mk(d.path(), "hooked");
+
+    let (ok, stdout, stderr) = run_streams(d.path(), &["task", "start", "--id", &id, "--actor", "agent"]);
+    assert!(ok, "the transition itself succeeds");
+    assert!(stdout.contains(&id), "the task still renders on stdout: {stdout:?}");
+    assert!(
+        stderr.contains("warning:") && stderr.contains("HOOK_FAILED"),
+        "the failed hook must be reported to a human too, got stderr {stderr:?}"
+    );
+}
+
+#[test]
+fn an_unreadable_task_is_reported_rather_than_treated_as_absent() {
+    // `get` maps a parse failure to None, so a task file this build cannot read was
+    // indistinguishable from one that does not exist — it vanished from show and list in silence.
+    let d = setup();
+    let id = mk(d.path(), "readable");
+    let broken = mk(d.path(), "about to break");
+    let path = d
+        .path()
+        .join("workspaces/main/tasks")
+        .join(&broken)
+        .join("task.md");
+    std::fs::write(&path, format!("---\nid: {broken}\nstatus: teleported\n---\n\n")).unwrap();
+
+    let (ok, r) = run(d.path(), &["task", "show", "--id", &broken, "--json"]);
+    assert!(!ok, "an unreadable task is not a success: {r}");
+    assert_eq!(
+        r["errors"][0]["code"], "TASK_UNREADABLE",
+        "and it is not the same thing as absent: {r}"
+    );
+
+    let (ok, r) = run(d.path(), &["task", "list", "--json"]);
+    assert!(ok, "list still works: {r}");
+    assert_eq!(r["data"].as_array().unwrap().len(), 1, "only the readable task: {r}");
+    assert!(
+        r["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["message"].as_str().unwrap_or_default().contains(&broken)),
+        "but the unreadable one is named rather than dropped: {r}"
+    );
+}
+
+#[test]
+fn attach_with_the_current_version_still_succeeds() {
+    // The guard added ahead of the copy must refuse only a *stale* version. Without this, a
+    // correct --version could be rejected and every guarded attach would break.
+    let d = setup();
+    let id = mk(d.path(), "with files");
+    let src = d.path().join("spec.txt");
+    std::fs::write(&src, "hello").unwrap();
+    let (_, shown) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
+    let version = shown["data"]["version"].as_i64().expect("a version").to_string();
+
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task", "add-attachment", "--id", &id, "--path", src.to_str().unwrap(),
+            "--mode", "copy", "--actor", "agent", "--version", &version, "--json",
+        ],
+    );
+    assert!(ok, "the current version must be accepted: {r}");
+    assert_eq!(r["data"]["attachment_refs"].as_array().unwrap().len(), 1, "{r}");
+    assert!(
+        d.path().join("workspaces/main/tasks").join(&id).join("attachments/spec.txt").exists(),
+        "and the file is copied"
+    );
+}

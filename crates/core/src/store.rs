@@ -29,7 +29,11 @@ pub trait TaskStore {
     fn append_audit(&mut self, entry: AuditEntry) -> std::io::Result<()>;
     /// Allocate the next task id. On the trait because generating a recurring task's next
     /// occurrence is domain logic that has to mint an id without knowing the storage kind.
-    fn allocate_id(&mut self) -> String;
+    ///
+    /// Fallible because the alternative was worse: returning a bare `String` left the only
+    /// implementation that can fail with nothing to do but invent one, and the caller then wrote
+    /// a task under that invented id as though nothing had gone wrong.
+    fn allocate_id(&mut self) -> std::io::Result<String>;
 }
 
 /// In-memory store for tests.
@@ -104,8 +108,8 @@ impl TaskStore for MemoryStore {
         Ok(())
     }
 
-    fn allocate_id(&mut self) -> String {
+    fn allocate_id(&mut self) -> std::io::Result<String> {
         self.next += 1;
-        format!("TASK-{:04}", self.next + 1000)
+        Ok(format!("TASK-{:04}", self.next + 1000))
     }
 }

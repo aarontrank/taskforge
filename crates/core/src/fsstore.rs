@@ -44,18 +44,100 @@ impl FsStore {
     }
 
     /// Allocate the next task id, persisting the sequence so a new handle continues it.
+    ///
+    /// **The id is claimed by creating its directory, not by the counter.** The counter is a
+    /// read-modify-write with no lock, so two concurrent callers can read the same number; what
+    /// stops them both using it is that `create_dir` fails atomically with `AlreadyExists`, so
+    /// only one can take the id and the loser tries the next one. Without that, both callers were
+    /// handed the same id and the second `put` silently overwrote the first task.
+    ///
+    /// **That uniqueness is per-workspace, because the claim is.** The counter lives at the root
+    /// and is shared, while the claimed directory is under `workspaces/<name>/tasks/`, so two
+    /// workspaces racing on the counter can each be handed the same id. That is deliberate rather
+    /// than overlooked: a workspace is the unit of storage *and* of resolution — `get`, `list` and
+    /// every id reference on a task resolve inside one — so the two tasks never meet, and neither
+    /// can overwrite the other. The guarantee that matters is the one this provides: within a
+    /// workspace, an id is never handed out twice. `two_workspaces_can_hold_the_same_id_and_stay_independent`
+    /// pins the cross-workspace behaviour so it stays a known property rather than a surprise.
     pub fn next_id(&self) -> std::io::Result<String> {
         let path = self.root.join("task_counter.json");
-        let next: u64 = fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| {
-                serde_json::from_str::<serde_json::Value>(&s)
-                    .ok()
-                    .and_then(|v| v.get("next").and_then(|n| n.as_u64()))
-            })
-            .unwrap_or(1);
-        fs::write(&path, format!("{{\"next\":{}}}\n", next + 1))?;
-        Ok(format!("TASK-{next:04}"))
+        let tasks = self.workspace_dir().join("tasks");
+        // Bounded so no filesystem state can spin here forever. The bound is far above any real
+        // contention: reaching it means a thousand consecutive ids are already taken, which is a
+        // repository to look at rather than a race to retry.
+        //
+        // Two paths below are deliberately untested: exhausting the bound (it needs a thousand
+        // occupied ids to reach) and a `create_dir` failure that is not `AlreadyExists` (it needs
+        // an unwritable tasks/ directory). Both are one-line propagations, and a test for the
+        // second would turn on file permissions behaving identically for every user that builds
+        // this — a flaky test on the build fleet in exchange for a covered `return Err(e)`.
+        for _ in 0..1_000 {
+            let next = Self::read_counter(&path)?;
+            Self::write_counter(&path, next + 1)?;
+            let id = format!("TASK-{next:04}");
+            fs::create_dir_all(&tasks)?;
+            match fs::create_dir(tasks.join(&id)) {
+                Ok(()) => return Ok(id),
+                // Someone else holds it. The counter has already moved on, so just try again.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not find a free task id in 1000 attempts",
+        ))
+    }
+
+    /// Replace the counter without ever leaving a partial file for a concurrent reader.
+    ///
+    /// `fs::write` truncates and then writes, so another process reading in that window sees an
+    /// empty or half-written file. That was harmless only while a bad read silently became 1;
+    /// now that it is correctly an error, a plain write turns ordinary concurrent creation into
+    /// sporadic `IO_ERROR`s. Measured: 138 of 160 concurrent allocations failed that way.
+    ///
+    /// Writing a temp file and renaming it fixes that, because `rename` within a directory is
+    /// atomic — a reader sees either the whole old file or the whole new one. The temp name
+    /// carries both the pid and a per-process sequence, so no two writers can ever share one:
+    /// if they did, one could rename away a file the other had only partly written, which is the
+    /// very failure this avoids.
+    fn write_counter(path: &std::path::Path, next: u64) -> std::io::Result<()> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Alongside the real file, so the rename cannot cross a filesystem boundary.
+        let tmp = path.with_file_name(format!(
+            "task_counter.json.{}.{unique}.tmp",
+            std::process::id()
+        ));
+        fs::write(&tmp, format!("{{\"next\":{next}}}\n"))?;
+        if let Err(e) = fs::rename(&tmp, path) {
+            // Leaving the temp file behind would litter the repository root on every failure.
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The next number the counter offers, or an error explaining why it cannot be read.
+    ///
+    /// Only **absence** legitimately means 1. Collapsing "unreadable" and "corrupt" into 1 as
+    /// well — which is what a chain of `.ok()` did — restarts the sequence over a live
+    /// repository, so the next create re-issues `TASK-0001` and overwrites it. Every other
+    /// write path in this file propagates its IO errors for the same reason.
+    fn read_counter(path: &std::path::Path) -> std::io::Result<u64> {
+        match fs::read_to_string(path) {
+            Ok(s) => serde_json::from_str::<serde_json::Value>(&s)
+                .ok()
+                .and_then(|v| v.get("next").and_then(|n| n.as_u64()))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{} has no readable `next` counter", path.display()),
+                    )
+                }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(1),
+            Err(e) => Err(e),
+        }
     }
 
     fn append_line(&self, id: &str, file: &str, line: &str) -> std::io::Result<()> {
@@ -112,6 +194,23 @@ impl FsStore {
         self.list_ids()
             .iter()
             .filter_map(|id| self.get(id))
+            .collect()
+    }
+
+    /// Ids whose `task.md` exists but cannot be read back as a [`Task`].
+    ///
+    /// [`FsStore::get`] returns `None` for both "no such task" and "the file is there and
+    /// unreadable", and [`FsStore::list`] filters `None` out — so a task file carrying a status
+    /// this build does not recognize used to disappear from `list` and `show` with no diagnostic.
+    /// Callers pair this with `list` to say so out loud.
+    ///
+    /// Requiring `task.md` to exist is what keeps a *reserved* id out of this list:
+    /// [`FsStore::next_id`] claims an id by creating its directory, so an allocation whose write
+    /// never happened leaves an empty folder that is not a corrupt task.
+    pub fn unreadable_ids(&self) -> Vec<String> {
+        self.list_ids()
+            .into_iter()
+            .filter(|id| self.task_dir(id).join("task.md").is_file() && self.get(id).is_none())
             .collect()
     }
 
@@ -215,16 +314,198 @@ impl TaskStore for FsStore {
         self.append_line(&entry.task_id.clone(), "audit.log", &line)
     }
 
-    fn allocate_id(&mut self) -> String {
-        // A failed allocation must not silently reuse an id, so fall back to a timestamp
-        // rather than to a fixed value.
+    fn allocate_id(&mut self) -> std::io::Result<String> {
         self.next_id()
-            .unwrap_or_else(|_| format!("TASK-ERR-{}", std::process::id()))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_counter_legitimately_starts_at_one() {
+        // The one case where starting over is correct: no counter file has been written yet.
+        // Guards the fix below from over-reaching into this path.
+        let d = tempfile::tempdir().unwrap();
+        let s = FsStore::new(d.path(), "main");
+        assert_eq!(s.next_id().expect("a fresh repository allocates"), "TASK-0001");
+    }
+
+    #[test]
+    fn a_corrupt_counter_is_reported_rather_than_restarting_the_sequence() {
+        // Restarting at 1 re-issues TASK-0001 and `put` overwrites the existing task — data loss
+        // reported as success. Only "the file is not there yet" may legitimately mean 1.
+        let (d, mut s) = root();
+        s.put(task("TASK-0001")).unwrap();
+        std::fs::write(d.path().join("task_counter.json"), "{ this is not json").unwrap();
+
+        let err = s.next_id().expect_err("a corrupt counter must not silently reset");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            s.get("TASK-0001").is_some(),
+            "the existing task must still be there"
+        );
+    }
+
+    #[test]
+    fn a_counter_missing_its_next_key_is_also_reported() {
+        // Valid JSON, wrong shape — the other way the old `.ok()` chain collapsed into 1.
+        let (d, s) = root();
+        std::fs::write(d.path().join("task_counter.json"), "{\"nxet\":7}").unwrap();
+        assert_eq!(
+            s.next_id().expect_err("a counter with no usable next must be reported").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn an_id_is_never_handed_out_twice_even_if_the_counter_is_stale() {
+        // Stands in for two concurrent creates reading the same counter: rewind it and allocate
+        // again. Without an atomic claim both callers get the same id and the second `put`
+        // silently overwrites the first task.
+        let (d, s) = root();
+        let first = s.next_id().unwrap();
+        std::fs::write(d.path().join("task_counter.json"), "{\"next\":1}").unwrap();
+        let second = s.next_id().unwrap();
+        assert_ne!(first, second, "two allocations must not collide");
+    }
+
+    #[test]
+    fn a_task_whose_file_cannot_be_parsed_is_named_rather_than_dropped() {
+        // `get` maps a parse failure to None and `list` filters None out, so a task file this
+        // build cannot read disappears from `list` and `show` with no diagnostic at all.
+        let (d, mut s) = root();
+        s.put(task("TASK-0001")).unwrap();
+        s.put(task("TASK-0002")).unwrap();
+        let broken = d.path().join("workspaces/main/tasks/TASK-0002/task.md");
+        std::fs::write(&broken, "---\nstatus: teleported\nid: TASK-0002\n---\n\n").unwrap();
+
+        assert_eq!(s.list().len(), 1, "the readable task still lists");
+        assert_eq!(
+            s.unreadable_ids(),
+            vec!["TASK-0002".to_string()],
+            "the unreadable one must be reportable, not invisible"
+        );
+    }
+
+    #[test]
+    fn many_threads_allocating_at_once_all_succeed_with_distinct_ids() {
+        // The real contention this store sees, exercised rather than reasoned about. It catches
+        // both ways concurrent allocation can go wrong: two callers receiving the same id, and a
+        // caller failing outright because it read the counter file mid-rewrite.
+        let d = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(FsStore::new(d.path(), "main"));
+        s.init().unwrap();
+
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let s = std::sync::Arc::clone(&s);
+                std::thread::spawn(move || {
+                    (0..20)
+                        .map(|_| s.next_id())
+                        .collect::<Vec<std::io::Result<String>>>()
+                })
+            })
+            .collect();
+
+        let mut ids = std::collections::BTreeSet::new();
+        let mut failures = Vec::new();
+        let mut total = 0;
+        for t in threads {
+            for r in t.join().expect("thread does not panic") {
+                total += 1;
+                match r {
+                    Ok(id) => {
+                        ids.insert(id);
+                    }
+                    Err(e) => failures.push(e.to_string()),
+                }
+            }
+        }
+        assert_eq!(total, 160, "every allocation is accounted for");
+        assert!(
+            failures.is_empty(),
+            "concurrent allocation must not fail: {failures:?}"
+        );
+        assert_eq!(ids.len(), 160, "and every id must be distinct");
+    }
+
+    #[test]
+    fn two_workspaces_can_hold_the_same_id_and_stay_independent() {
+        // The atomic claim is the task *directory*, which is per-workspace, while the counter is
+        // shared across the whole root. So the uniqueness guarantee is per-workspace, and two
+        // workspaces racing on the counter can be handed the same id. Pinned by a test rather
+        // than left as an unstated risk: it is benign because every read, write and reference
+        // resolves inside one workspace, so the two tasks never meet.
+        let d = tempfile::tempdir().unwrap();
+        let mut main = FsStore::new(d.path(), "main");
+        let mut side = FsStore::new(d.path(), "side");
+        main.init().unwrap();
+        side.init().unwrap();
+
+        let a = main.next_id().unwrap();
+        // Rewind the shared counter, standing in for the other workspace reading it first.
+        std::fs::write(d.path().join("task_counter.json"), "{\"next\":1}").unwrap();
+        let b = side.next_id().unwrap();
+        assert_eq!(a, b, "the same id can be issued in two workspaces");
+
+        let mut in_main = task(&a);
+        in_main.workspace = "main".into();
+        in_main.title = "the main one".into();
+        let mut in_side = task(&b);
+        in_side.workspace = "side".into();
+        in_side.title = "the side one".into();
+        main.put(in_main).unwrap();
+        side.put(in_side).unwrap();
+
+        assert_eq!(main.get(&a).unwrap().title, "the main one");
+        assert_eq!(side.get(&b).unwrap().title, "the side one", "neither overwrote the other");
+    }
+
+    #[test]
+    fn a_reserved_id_with_no_task_file_is_not_reported_as_unreadable() {
+        // `next_id` claims an id by creating its folder, so a create that never got as far as
+        // writing task.md leaves an empty one. That is an unused reservation, not a corrupt task,
+        // and reporting it would cry wolf on every abandoned allocation.
+        let (d, s) = root();
+        let id = s.next_id().unwrap();
+        assert!(
+            d.path().join("workspaces/main/tasks").join(&id).is_dir(),
+            "the id is claimed by its directory"
+        );
+        assert!(
+            s.unreadable_ids().is_empty(),
+            "an empty reservation is not an unreadable task: {:?}",
+            s.unreadable_ids()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_counter_is_propagated_rather_than_read_as_absent() {
+        // Only NotFound may mean "start at 1". A counter that exists but cannot be read is a
+        // different problem and must surface as itself — here a directory in its place, which
+        // read_to_string refuses with something other than NotFound.
+        let (d, s) = root();
+        let counter = d.path().join("task_counter.json");
+        std::fs::remove_file(&counter).unwrap();
+        std::fs::create_dir(&counter).unwrap();
+
+        let err = s.next_id().expect_err("an unreadable counter must be reported");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "and not mistaken for a missing one: {err}"
+        );
+    }
+
+    #[test]
+    fn allocate_id_reports_a_failure_instead_of_inventing_an_id() {
+        // The trait used to return String and swallowed the error into `TASK-ERR-<pid>`, which a
+        // caller would then happily write to disk as a real task.
+        let (d, mut s) = root();
+        std::fs::write(d.path().join("task_counter.json"), "nonsense").unwrap();
+        assert!(s.allocate_id().is_err(), "a failed allocation must be an error");
+    }
+
     use crate::fsstore::*;
     use crate::model::{Task, TaskStatus};
     use crate::store::{AuditEntry, TaskStore};

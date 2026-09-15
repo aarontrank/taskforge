@@ -31,8 +31,9 @@ context. Currently emitted:
 | Warning code | Meaning | `detail` |
 |---|---|---|
 | `HOOK_FAILED` | A hook exited non-zero, timed out, or could not be started | `hook_id`, `exit_code`, `timed_out`, `started` |
-| `AUDIT_WRITE_FAILED` | The change is stored; its `audit.log` line is not | — |
-| `RECURRENCE_WRITE_FAILED` | A recurring task completed; its successor was not created | — |
+| `AUDIT_WRITE_FAILED` | The change is stored; its `audit.log` line is not. Also raised when a recurring task's *successor* was written but its audit line was not — the successor exists and is reported in `next_occurrence_id`, so do not re-create it | — |
+| `RECURRENCE_WRITE_FAILED` | A recurring task completed and its successor genuinely was **not** written | — |
+| `TASK_UNREADABLE` | On `task list`: named tasks are omitted because their `task.md` cannot be read. They exist — they are not deleted — so the list is incomplete rather than authoritative | — |
 
 ```json
 {
@@ -190,10 +191,12 @@ form, so reading and writing migrates it.
 ```bash
 taskforge task set-review --id TASK-0001 --actor agent --json \
   [--review-id PR-4821] [--expected-by 2026-09-03T17:00:00Z]
+```
 
 `--review-id` here sets the review list to exactly that one review. To gate a task on more than
 one, use `add-review`.
 
+```bash
 taskforge task set-worker --id TASK-0001 --actor agent --json \
   [--worker review-worker-1] [--checkout 3]
 ```
@@ -312,6 +315,7 @@ date), `relative` (advance from completion time). Month arithmetic clamps to the
 | Code | Meaning |
 |---|---|
 | `TASK_NOT_FOUND` | No such task id |
+| `TASK_UNREADABLE` | The task exists but its `task.md` cannot be parsed — usually a `status` or `kind` this build does not know. Distinct from `TASK_NOT_FOUND` on purpose: the data is there and the fix is to correct the file, not to re-create the task |
 | `OWNER_NOT_FOUND` | Owner is not in the registry. The message names the registered owners, or tells you how to add the first one |
 | `INVALID_STATUS_TRANSITION` | That move is not legal from the current status |
 | `BLOCKED_BY_OPEN_TASK` | A blocker is not `done`. The message names which |

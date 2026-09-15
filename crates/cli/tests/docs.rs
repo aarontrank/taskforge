@@ -379,3 +379,68 @@ fn the_skill_description_names_every_status_it_counts() {
         "if the count changes, this test and the description must change together"
     );
 }
+
+#[test]
+fn no_prose_is_trapped_inside_a_bash_block() {
+    // A `bash` block that is reopened rather than closed swallows the explanation between two
+    // examples, so it renders as code and the reader loses it. Counting fences does not find this
+    // — they stay balanced — so the signal is a line of prose where a command should be. A shell
+    // line in these docs never starts with a markdown backtick; a sentence about a flag does.
+    let mut broken = Vec::new();
+    for file in ["SKILL.md", "reference.md", "workflows.md"] {
+        let text = doc(file);
+        let mut in_bash = false;
+        for (n, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if let Some(lang) = trimmed.strip_prefix("```") {
+                // Only the opening fence carries the language; the closing one is bare.
+                in_bash = !in_bash && lang.trim() == "bash";
+                continue;
+            }
+            if in_bash && trimmed.starts_with('`') {
+                broken.push(format!("{file}:{}: {}", n + 1, trimmed));
+            }
+        }
+    }
+    assert!(
+        broken.is_empty(),
+        "prose inside a bash block — close the fence before it:\n  {}",
+        broken.join("\n  ")
+    );
+}
+
+#[test]
+fn no_documented_block_reuses_one_version_across_two_mutations() {
+    // Every mutating command bumps `version`, so a second command reusing the same captured
+    // value is guaranteed CONFLICT_VERSION_MISMATCH. An agent following such an example
+    // literally cannot succeed, and the concurrency section had exactly that shape.
+    let mut broken = Vec::new();
+    for file in ["SKILL.md", "reference.md", "workflows.md"] {
+        let text = doc(file);
+        let mut in_block = false;
+        let mut block = Vec::new();
+        for line in text.lines() {
+            if line.trim_start().starts_with("```") {
+                if in_block {
+                    let reuses = block
+                        .iter()
+                        .filter(|l: &&String| l.contains("--version \"$v\""))
+                        .count();
+                    if reuses > 1 {
+                        broken.push(format!(
+                            "{file}: one block passes --version \"$v\" to {reuses} commands; \
+                             the value is stale after the first"
+                        ));
+                    }
+                    block.clear();
+                }
+                in_block = !in_block;
+                continue;
+            }
+            if in_block {
+                block.push(line.to_string());
+            }
+        }
+    }
+    assert!(broken.is_empty(), "stale version in a documented example:\n  {}", broken.join("\n  "));
+}

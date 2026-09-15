@@ -220,7 +220,7 @@ impl<S: TaskStore> TaskService<S> {
         rec: &Recurrence,
         actor: &str,
     ) -> std::io::Result<String> {
-        let id = self.store.allocate_id();
+        let id = self.store.allocate_id()?;
         let mut next = Task::new(
             &id,
             &prior.title,
@@ -245,14 +245,23 @@ impl<S: TaskStore> TaskService<S> {
         next.due_at = self.next_due(prior, rec);
 
         self.store.put(next)?;
-        self.store.append_audit(AuditEntry {
+        // The successor is committed from here on. A failed audit append leaves an incomplete
+        // trail — worth reporting, never worth claiming the task was not created, because a
+        // caller told "no successor" creates a duplicate of one that already exists. Same rule
+        // as the status change above, which this path used to contradict.
+        if let Err(e) = self.store.append_audit(AuditEntry {
             ts: self.now.clone(),
             actor: actor.to_string(),
             action: "recurrence_generated".to_string(),
             task_id: id.clone(),
             from: Some(prior.id.clone()),
             to: None,
-        })?;
+        }) {
+            self.last_warnings.push(Warning {
+                code: "AUDIT_WRITE_FAILED",
+                message: format!("{id} was created but its audit entry was not written: {e}"),
+            });
+        }
         Ok(id)
     }
 
@@ -893,6 +902,48 @@ mod tests {
                 .iter()
                 .any(|w| w.code == "RECURRENCE_WRITE_FAILED"),
             "but the caller is told one was not created: {:?}",
+            s.last_warnings
+        );
+    }
+
+    #[test]
+    fn a_successor_whose_audit_append_fails_is_still_reported_as_created() {
+        // The successor is written before its audit line, so when only the audit fails the task
+        // IS on disk. Claiming "its next occurrence was not created" then sends the caller to
+        // create a duplicate. The status-change path a few lines above already downgrades exactly
+        // this to a warning; this path was the one left inconsistent with it.
+        let mut s = svc();
+        let mut t = recurring(
+            "TASK-0001",
+            RecurrenceFrequency::Daily,
+            None,
+            DueStrategy::None,
+        );
+        t.status = TaskStatus::Running;
+        s.store.put(t).unwrap();
+        s.store.fail_audit_now();
+
+        let out = s
+            .set_status("TASK-0001", TaskStatus::Done, "agent", None)
+            .expect("the completion stands");
+        assert_eq!(out.status, TaskStatus::Done);
+        let id = s
+            .last_generated
+            .clone()
+            .expect("the successor was written, so it must be reported");
+        assert!(s.store.get(&id).is_some(), "and it really is in the store");
+        assert!(
+            !s.last_warnings
+                .iter()
+                .any(|w| w.code == "RECURRENCE_WRITE_FAILED"),
+            "it was created, so nothing may claim otherwise: {:?}",
+            s.last_warnings
+        );
+        assert!(
+            s.last_warnings
+                .iter()
+                .any(|w| w.code == "AUDIT_WRITE_FAILED" && w.message.contains(&id)),
+            "but the missing audit line is still reported, naming it: {:?}",
             s.last_warnings
         );
     }
