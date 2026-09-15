@@ -2249,6 +2249,13 @@ fn version_names_the_commit_it_was_built_from() {
         .and_then(|s| s.split(')').next())
         .unwrap_or_default()
         .to_string();
+    // A build with no `.git` — installing from a release tarball, or from a published crate — bakes
+    // `unknown`, which is the honest answer and must not be mistaken for a sha. Note the length
+    // check below does NOT distinguish them: `unknown` is itself seven characters, so the two cases
+    // are separated explicitly rather than by coincidence.
+    if commit == "unknown" {
+        return;
+    }
     assert_eq!(commit.len(), 7, "a 7-char short sha, got {out:?}");
     assert!(
         commit.chars().all(|c| c.is_ascii_hexdigit()),
@@ -2269,6 +2276,16 @@ fn the_envelope_version_stays_a_bare_semver() {
     );
 }
 
+/// Whether this test binary was built with a readable git checkout behind it.
+///
+/// A build from a release tarball or a published crate has no `.git`, so `build.rs` bakes
+/// `commit=unknown` and `doctor` correctly answers `unknown` instead of `fresh`. Both environments
+/// are legitimate and they assert different things, so the tests below branch on this rather than
+/// assuming the checkout that only a source build has.
+fn built_in_a_checkout(v: &serde_json::Value) -> bool {
+    v["data"]["binary"]["commit"] != "unknown"
+}
+
 #[test]
 fn doctor_reports_this_test_binary_as_fresh() {
     // Built from the checkout it is now comparing against, so the only honest answer is fresh.
@@ -2276,12 +2293,21 @@ fn doctor_reports_this_test_binary_as_fresh() {
     // that does not exist yet — which is why `freshness` is a pure function tested separately.
     let d = setup();
     let (ok, v) = run(d.path(), &["doctor", "--json"]);
-    assert!(ok, "fresh must exit 0: {v}");
-    assert_eq!(v["data"]["state"], "fresh", "{v}");
-    assert_eq!(
-        v["data"]["binary"]["commit"], v["data"]["source"]["commit"],
-        "fresh means the two commits agree: {v}"
-    );
+    assert!(ok, "doctor must exit 0 when nothing is stale: {v}");
+    if built_in_a_checkout(&v) {
+        assert_eq!(v["data"]["state"], "fresh", "{v}");
+        assert_eq!(
+            v["data"]["binary"]["commit"], v["data"]["source"]["commit"],
+            "fresh means the two commits agree: {v}"
+        );
+    } else {
+        // No commit was baked, so there is nothing to compare and `unknown` is the whole point:
+        // calling this "fresh" would be the comforting lie `build.rs` exists to avoid.
+        assert_eq!(
+            v["data"]["state"], "unknown",
+            "a build with no checkout must not claim to be fresh: {v}"
+        );
+    }
 }
 
 #[test]
@@ -2290,10 +2316,7 @@ fn doctor_reports_where_the_source_is_and_when_the_binary_was_built() {
     // checkout to reinstall from.
     let d = setup();
     let (_, v) = run(d.path(), &["doctor", "--json"]);
-    assert!(
-        v["data"]["source"]["dir"].as_str().unwrap().contains('/'),
-        "a real path: {v}"
-    );
+    // The build time is baked unconditionally, so it is the one field both environments must have.
     assert!(
         v["data"]["binary"]["built_at"]
             .as_str()
@@ -2301,10 +2324,19 @@ fn doctor_reports_where_the_source_is_and_when_the_binary_was_built() {
             .starts_with("20"),
         "an RFC3339 timestamp: {v}"
     );
-    assert_eq!(
-        v["data"]["source"]["version"], v["data"]["binary"]["version"],
-        "a fresh build's two versions agree: {v}"
-    );
+    if built_in_a_checkout(&v) {
+        assert!(
+            v["data"]["source"]["dir"].as_str().unwrap().contains('/'),
+            "a real path: {v}"
+        );
+        assert_eq!(
+            v["data"]["source"]["version"], v["data"]["binary"]["version"],
+            "a fresh build's two versions agree: {v}"
+        );
+    } else {
+        // Reporting a path it never had would send someone to reinstall from nowhere.
+        assert_eq!(v["data"]["source"]["dir"], "unknown", "{v}");
+    }
 }
 
 /// Run the binary and return (success, stdout, stderr). Text-mode output goes to both streams, so
@@ -2441,11 +2473,11 @@ fn an_unreadable_task_is_reported_rather_than_treated_as_absent() {
 
     let (ok, r) = run(d.path(), &["task", "list", "--json"]);
     assert!(ok, "list still works: {r}");
-    assert_eq!(
-        r["data"].as_array().unwrap().len(),
-        1,
-        "only the readable task: {r}"
-    );
+    let listed = r["data"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "only the readable task: {r}");
+    // Named rather than merely counted: a list of one proves nothing about *which* one, and the
+    // failure being guarded against is a task going missing.
+    assert_eq!(listed[0]["id"], id, "and it is the readable one: {r}");
     assert!(
         r["warnings"]
             .as_array()
@@ -2508,7 +2540,10 @@ fn attach_with_the_current_version_still_succeeds() {
 fn merged_task(root: &std::path::Path, actor: &str) -> String {
     let id = mk(root, "ready to accept");
     for step in ["start", "request-review", "merge"] {
-        let (ok, r) = run(root, &["task", step, "--id", &id, "--actor", actor, "--json"]);
+        let (ok, r) = run(
+            root,
+            &["task", step, "--id", &id, "--actor", actor, "--json"],
+        );
         assert!(ok, "{step}: {r}");
     }
     id
@@ -2543,7 +2578,9 @@ fn a_human_reaching_done_is_not_warned_about() {
     let d = setup();
     let (ok, _) = run(
         d.path(),
-        &["owner", "add", "--name", "aaron", "--type", "human", "--json"],
+        &[
+            "owner", "add", "--name", "aaron", "--type", "human", "--json",
+        ],
     );
     assert!(ok, "register a human");
     let id = merged_task(d.path(), "agent");

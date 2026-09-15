@@ -483,8 +483,14 @@ mod tests {
         let path = s.task_dir("TASK-0001").join("task.md");
         let edited = std::fs::read_to_string(&path)
             .unwrap()
-            .replace("- [ ] \n", "- [x] fsstore round-trips\n- [ ] audit log appends\n")
-            .replace("## Notes\n\n", "## Notes\n\nTalked to Dana; see the sketch.\n");
+            .replace(
+                "- [ ] \n",
+                "- [x] fsstore round-trips\n- [ ] audit log appends\n",
+            )
+            .replace(
+                "## Notes\n\n",
+                "## Notes\n\nTalked to Dana; see the sketch.\n",
+            );
         std::fs::write(&path, &edited).unwrap();
 
         // Any later mutation.
@@ -493,10 +499,22 @@ mod tests {
         s.put(t).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
-        assert!(after.contains("- [x] fsstore round-trips"), "criteria kept:\n{after}");
-        assert!(after.contains("- [ ] audit log appends"), "and the added line:\n{after}");
-        assert!(after.contains("Talked to Dana; see the sketch."), "notes kept:\n{after}");
-        assert!(after.contains("status: in-review"), "and the frontmatter still updated:\n{after}");
+        assert!(
+            after.contains("- [x] fsstore round-trips"),
+            "criteria kept:\n{after}"
+        );
+        assert!(
+            after.contains("- [ ] audit log appends"),
+            "and the added line:\n{after}"
+        );
+        assert!(
+            after.contains("Talked to Dana; see the sketch."),
+            "notes kept:\n{after}"
+        );
+        assert!(
+            after.contains("status: in-review"),
+            "and the frontmatter still updated:\n{after}"
+        );
     }
 
     #[test]
@@ -592,8 +610,14 @@ mod tests {
         s.put(t).unwrap();
 
         let after = std::fs::read_to_string(s.task_dir("TASK-0001").join("task.md")).unwrap();
-        assert!(after.contains("second wording"), "summary follows description:\n{after}");
-        assert!(!after.contains("first wording"), "and the old wording is gone:\n{after}");
+        assert!(
+            after.contains("second wording"),
+            "summary follows description:\n{after}"
+        );
+        assert!(
+            !after.contains("first wording"),
+            "and the old wording is gone:\n{after}"
+        );
     }
 
     #[test]
@@ -613,7 +637,10 @@ mod tests {
         s.put(t).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
-        assert!(after.contains("## Design sketch"), "custom heading kept:\n{after}");
+        assert!(
+            after.contains("## Design sketch"),
+            "custom heading kept:\n{after}"
+        );
         assert!(after.contains("A then B."), "and its content:\n{after}");
     }
 
@@ -691,7 +718,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "no staged file may be left: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "no staged file may be left: {leftovers:?}"
+        );
     }
 
     #[test]

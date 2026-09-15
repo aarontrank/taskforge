@@ -170,22 +170,20 @@ impl<S: TaskStore> TaskService<S> {
         // Conditional on the version still being what was read at the top of this function. The
         // checks above all happened before it, so another writer landing in between would be
         // silently overwritten — both would compute the same next version and the later one wins.
-        self.store
-            .put_if_version(task.clone(), seen)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    TaskError::VersionMismatch {
-                        id: id.to_string(),
-                        expected: seen,
-                        actual: self.store.get(id).map_or(seen, |t| t.version),
-                    }
-                } else {
-                    TaskError::Io {
-                        id: id.to_string(),
-                        source: e,
-                    }
+        self.store.put_if_version(task.clone(), seen).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                TaskError::VersionMismatch {
+                    id: id.to_string(),
+                    expected: seen,
+                    actual: self.store.get(id).map_or(seen, |t| t.version),
                 }
-            })?;
+            } else {
+                TaskError::Io {
+                    id: id.to_string(),
+                    source: e,
+                }
+            }
+        })?;
 
         // Everything below runs after the change is committed, so no failure here can un-commit
         // it. Each is therefore a warning: real, reported, and not an error.

@@ -635,6 +635,13 @@ updated_at: 2026-09-03T00:00:00Z
         t.status = TaskStatus::InReview;
         t.expected_by = Some("2026-09-08".into());
         assert!(t.is_overdue("2026-09-09T00:00:00Z"), "the day has passed");
+        // The assertion that was missing, and whose absence let the docs claim the wrong instant:
+        // the window closes at midnight *starting* the 8th, so the task is overdue throughout that
+        // day, not from the 9th. Both assertions below were true and neither pinned this.
+        assert!(
+            t.is_overdue("2026-09-08T09:00:00Z"),
+            "a bare date is overdue during that same day, not from the next one"
+        );
         assert!(
             !t.is_overdue("2026-09-08T00:00:00Z"),
             "midnight itself is the start of the window, not past it"

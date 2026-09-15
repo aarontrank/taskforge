@@ -231,8 +231,10 @@ attention.
 RFC3339 timestamp like `2026-09-08T17:00:00Z`. Anything else is refused with `INVALID_DATE`
 before the task is touched, and the message names both legal forms.
 
-Prefer the full timestamp when the hour matters: `--expected-by 2026-09-08` means the wait is
-overdue from `2026-09-09T00:00:00Z`, not at close of business on the 8th.
+Prefer the full timestamp when the hour matters. `--expected-by 2026-09-08` is `2026-09-08T00:00:00Z`,
+and overdue is *strictly after* that instant — so the task counts as overdue **throughout the 8th**,
+not from close of business and not from the 9th. A bare date is the start of the day you name, not the
+end of it.
 
 `merged` is deliberately *not* ignored. It is the state that rots silently while waiting for a
 human to `accept`, so it is exactly what these queries are for.
@@ -351,7 +353,7 @@ exists to prevent.
       "enabled": true,
       "event": "task.status_changed",
       "command": "sh",
-      "args": ["-c", "cat >> ~/task-events.ndjson"],
+      "args": ["-c", "cat >> ~/task-events.ndjson; echo >> ~/task-events.ndjson"],
       "workspace_filter": ["main"],
       "timeout_ms": 10000
     }
