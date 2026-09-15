@@ -152,6 +152,7 @@ impl<S: TaskStore> TaskService<S> {
             }
         }
 
+        let seen = task.version;
         task.status = to;
         task.updated_at = self.now.clone();
         task.version += 1;
@@ -165,10 +166,26 @@ impl<S: TaskStore> TaskService<S> {
 
         // The one write whose failure is fatal: until this lands, nothing has happened, and
         // reporting success would hand the caller a status that is not stored.
-        self.store.put(task.clone()).map_err(|e| TaskError::Io {
-            id: id.to_string(),
-            source: e,
-        })?;
+        //
+        // Conditional on the version still being what was read at the top of this function. The
+        // checks above all happened before it, so another writer landing in between would be
+        // silently overwritten — both would compute the same next version and the later one wins.
+        self.store
+            .put_if_version(task.clone(), seen)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    TaskError::VersionMismatch {
+                        id: id.to_string(),
+                        expected: seen,
+                        actual: self.store.get(id).map_or(seen, |t| t.version),
+                    }
+                } else {
+                    TaskError::Io {
+                        id: id.to_string(),
+                        source: e,
+                    }
+                }
+            })?;
 
         // Everything below runs after the change is committed, so no failure here can un-commit
         // it. Each is therefore a warning: real, reported, and not an error.
@@ -945,6 +962,30 @@ mod tests {
                 .any(|w| w.code == "AUDIT_WRITE_FAILED" && w.message.contains(&id)),
             "but the missing audit line is still reported, naming it: {:?}",
             s.last_warnings
+        );
+    }
+
+    #[test]
+    fn a_transition_refuses_when_another_writer_lands_mid_operation() {
+        // set_status reads the task, runs every rule against it, and only then writes. Another
+        // writer landing in that window used to be overwritten silently: both compute the same
+        // next version and the later write wins. The seam simulates exactly that arrival.
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap();
+        s.store.let_another_writer_win_once();
+
+        let err = s
+            .set_status("TASK-0001", TaskStatus::Running, "agent", None)
+            .expect_err("a lost update must be refused, not reported as success");
+        assert!(
+            matches!(err, TaskError::VersionMismatch { .. }),
+            "and reported as the conflict it is: {err:?}"
+        );
+        assert_eq!(err.code(), "CONFLICT_VERSION_MISMATCH");
+        assert_ne!(
+            s.store.get("TASK-0001").unwrap().status,
+            TaskStatus::Running,
+            "the refused transition must not have been stored"
         );
     }
 

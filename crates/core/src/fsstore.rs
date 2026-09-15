@@ -1,3 +1,18 @@
+//! The on-disk store: one directory per task, plain text throughout.
+//!
+//! The format is the feature. A task is a `task.md` whose YAML frontmatter is the [`Task`],
+//! followed by a markdown body, so the record stays readable with an editor, `grep` and `git`
+//! when this binary is unavailable or wrong.
+//!
+//! **Editable, with one section reserved.** The frontmatter is the [`Task`] and round-trips.
+//! `## Summary` is generated from the `description` field, so editing it there is pointless — it is
+//! rewritten on the next mutation, which is what keeps it from disagreeing with the field. From the
+//! first heading after it to the end of the file, the body is the writer's and is carried through
+//! every mutation byte-for-byte.
+//!
+//! Replacement is atomic — a temp file and a rename — so a concurrent reader never sees a task
+//! mid-write. See [`FsStore::write_atomically`] for what that measured before it was fixed.
+
 use crate::model::Task;
 use crate::store::{AuditEntry, TaskStore};
 use std::fs;
@@ -16,6 +31,12 @@ pub struct FsStore {
 }
 
 const FENCE: &str = "---";
+
+/// The body a new task starts with, after the generated `## Summary`.
+///
+/// A checklist heading so "what does done mean" has somewhere to live without the writer having to
+/// invent a structure, and a notes heading for everything else.
+const DEFAULT_TAIL: &str = "## Acceptance Criteria\n\n- [ ] \n\n## Notes\n\n";
 
 impl FsStore {
     pub fn new(root: impl Into<PathBuf>, workspace: impl Into<String>) -> Self {
@@ -89,33 +110,55 @@ impl FsStore {
         ))
     }
 
-    /// Replace the counter without ever leaving a partial file for a concurrent reader.
+    /// Replace a file's contents without ever exposing a partial state to a reader.
     ///
-    /// `fs::write` truncates and then writes, so another process reading in that window sees an
-    /// empty or half-written file. That was harmless only while a bad read silently became 1;
-    /// now that it is correctly an error, a plain write turns ordinary concurrent creation into
-    /// sporadic `IO_ERROR`s. Measured: 138 of 160 concurrent allocations failed that way.
+    /// `fs::write` truncates and then fills, so a concurrent reader lands in a window where the
+    /// file is empty or half written. Both places this matters were measured, and neither is
+    /// theoretical:
     ///
-    /// Writing a temp file and renaming it fixes that, because `rename` within a directory is
-    /// atomic — a reader sees either the whole old file or the whole new one. The temp name
-    /// carries both the pid and a per-process sequence, so no two writers can ever share one:
-    /// if they did, one could rename away a file the other had only partly written, which is the
-    /// very failure this avoids.
-    fn write_counter(path: &std::path::Path, next: u64) -> std::io::Result<()> {
+    /// * the counter — 138 of 160 concurrent allocations failed once an unreadable counter
+    ///   correctly became an error rather than silently restarting at 1; and
+    /// * a task file — **7368 of 7983** reads saw the task as *absent* while it was being
+    ///   rewritten, because a `task.md` with no frontmatter yet is indistinguishable from a task
+    ///   that does not exist.
+    ///
+    /// Writing a temp file and renaming it removes the window: `rename` within a directory is
+    /// atomic, so a reader sees the whole old file or the whole new one. The temp name carries the
+    /// pid and a per-process sequence, so no two writers can share one — if they did, one could
+    /// rename away a file the other had only partly written, which is the failure being avoided.
+    fn write_atomically(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+        let staged = Self::stage(path, contents)?;
+        Self::commit(&staged, path)
+    }
+
+    /// Write the new contents to a temp file beside `path`, ready to be renamed into place.
+    ///
+    /// Split from [`FsStore::commit`] so a caller can do work — specifically the
+    /// optimistic-concurrency re-check in [`FsStore::put_if_version`] — after the expensive part
+    /// and immediately before the single syscall that publishes it.
+    fn stage(path: &std::path::Path, contents: &str) -> std::io::Result<PathBuf> {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Alongside the real file, so the rename cannot cross a filesystem boundary.
-        let tmp = path.with_file_name(format!(
-            "task_counter.json.{}.{unique}.tmp",
-            std::process::id()
-        ));
-        fs::write(&tmp, format!("{{\"next\":{next}}}\n"))?;
-        if let Err(e) = fs::rename(&tmp, path) {
-            // Leaving the temp file behind would litter the repository root on every failure.
-            let _ = fs::remove_file(&tmp);
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        // Alongside the real file, so the rename cannot cross a filesystem boundary. Dot-prefixed
+        // so a temp left by a killed process does not look like content.
+        let tmp = path.with_file_name(format!(".{name}.{}.{unique}.tmp", std::process::id()));
+        fs::write(&tmp, contents)?;
+        Ok(tmp)
+    }
+
+    /// Publish staged contents, or clean up if the rename fails.
+    fn commit(staged: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
+        if let Err(e) = fs::rename(staged, path) {
+            // Leaving the temp behind would litter the repository on every failure.
+            let _ = fs::remove_file(staged);
             return Err(e);
         }
         Ok(())
+    }
+
+    fn write_counter(path: &std::path::Path, next: u64) -> std::io::Result<()> {
+        Self::write_atomically(path, &format!("{{\"next\":{next}}}\n"))
     }
 
     /// The next number the counter offers, or an error explaining why it cannot be read.
@@ -272,27 +315,97 @@ impl FsStore {
     /// Fallible because an empty-frontmatter fallback would be worse than an error: `get`
     /// reads a task with no frontmatter as absent, so a serialization failure would make the
     /// task disappear instead of reporting itself.
-    fn render(task: &Task) -> std::io::Result<String> {
+    fn render(task: &Task, tail: Option<&str>) -> std::io::Result<String> {
         let yaml = serde_yaml::to_string(task)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let description = task.description.clone().unwrap_or_default();
-        // Summary / Acceptance Criteria / Notes, matching the template this replaced. The
-        // middle heading is where a task records what "done" looks like, so a checklist has
-        // somewhere to live without the writer inventing a structure.
+        // `## Summary` is generated from `description`, so the two can never disagree. Everything
+        // after it is the writer's: `tail` carries it forward, and `DEFAULT_TAIL` seeds a new task
+        // with somewhere to record what "done" looks like.
+        let tail = tail.unwrap_or(DEFAULT_TAIL);
         Ok(format!(
-            "{FENCE}\n{yaml}{FENCE}\n\n## Summary\n\n{description}\n\n\
-             ## Acceptance Criteria\n\n- [ ] \n\n## Notes\n\n"
+            "{FENCE}\n{yaml}{FENCE}\n\n## Summary\n\n{description}\n\n{tail}"
         ))
+    }
+
+    /// The part of an existing `task.md` that belongs to whoever wrote it.
+    ///
+    /// Everything from the first `## ` heading after the generated `## Summary` to the end of the
+    /// file, returned as a slice of `text` so it is carried forward byte-for-byte. `None` when
+    /// there is no such heading — a brand-new task, or a body holding nothing but a summary — and
+    /// the caller then uses [`DEFAULT_TAIL`].
+    ///
+    /// Keyed on "the first heading that is not Summary" rather than on the template's own headings,
+    /// because nothing obliges a writer to keep them: a body reorganised under `## Design sketch`
+    /// must survive just as `## Notes` does.
+    fn preserved_tail(text: &str) -> Option<&str> {
+        let (front, body) = Self::split_frontmatter(text)?;
+        let body = body.trim_start_matches('\n');
+        // Strip exactly the Summary section this store would have written, using the description
+        // recorded in the file's *own* frontmatter rather than the one being written now. Whatever
+        // remains is the tail.
+        //
+        // Scanning for "the first heading that is not `## Summary`" instead is wrong, and wrong in a
+        // way that corrupts: `description` is free-form prose rendered *inside* the Summary section,
+        // so a description containing `## Risks` made that heading look like the start of the
+        // writer's body. `render` then re-emitted the description and appended a tail beginning
+        // mid-description — measured at three copies after three writes.
+        let stored: Task = serde_yaml::from_str(front).ok()?;
+        let described = stored.description.unwrap_or_default();
+        let summary = format!("## Summary\n\n{described}\n\n");
+        let tail = match body.strip_prefix(&summary) {
+            Some(tail) => tail,
+            // The Summary section is not what this store writes — a hand-rewritten body. There is
+            // no exact boundary left to match, so fall back to the first heading that did not come
+            // from the description.
+            None => Self::first_heading_not_in(body, &described)?,
+        };
+        (!tail.is_empty()).then_some(tail)
+    }
+
+    /// Split `text` into its frontmatter and everything after the closing fence.
+    fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+        let rest = text.strip_prefix(FENCE)?.trim_start_matches('\n');
+        let end = rest.find("\n---")?;
+        Some((&rest[..end], &rest[end + "\n---".len()..]))
+    }
+
+    /// Fallback tail boundary: the first `## ` heading that neither is `## Summary` nor appears in
+    /// `described`.
+    ///
+    /// Only reached when the Summary section has been hand-rewritten, so its exact extent cannot be
+    /// matched. Skipping headings that occur in the description is what stops this re-introducing the
+    /// duplication bug: a description containing `## Risks` renders that line inside the Summary
+    /// section, and treating it as the tail's start meant the next write emitted the description
+    /// again *and* appended a tail beginning mid-description — growing the file on every mutation.
+    ///
+    /// The residual case, accepted knowingly: a writer whose own tail heading is *also* one of the
+    /// description's headings loses that one section from the tail. That is a bounded, one-time loss
+    /// against unbounded duplication on every write, and it needs a hand-edited Summary to reach at
+    /// all. A `## ` boundary is only ambiguous because the generated section may contain arbitrary
+    /// markdown; an explicit end-of-Summary marker in the file would remove the ambiguity, at the
+    /// cost of a format change and a migration for every existing task.
+    fn first_heading_not_in<'b>(body: &'b str, described: &str) -> Option<&'b str> {
+        let mut offset = 0usize;
+        for line in body.split_inclusive('\n') {
+            let heading = line.trim_end();
+            if heading.starts_with("## ")
+                && heading != "## Summary"
+                && !described.lines().any(|l| l.trim_end() == heading)
+            {
+                return Some(&body[offset..]);
+            }
+            offset += line.len();
+        }
+        None
     }
 }
 
 impl TaskStore for FsStore {
     fn get(&self, id: &str) -> Option<Task> {
         let text = fs::read_to_string(self.task_dir(id).join("task.md")).ok()?;
-        // Everything between the opening fence and the next one is the frontmatter.
-        let rest = text.strip_prefix(FENCE)?.trim_start_matches('\n');
-        let end = rest.find("\n---")?;
-        serde_yaml::from_str(&rest[..end]).ok()
+        let (front, _) = Self::split_frontmatter(&text)?;
+        serde_yaml::from_str(front).ok()
     }
 
     /// Write `task.md`, creating the task folder if it is new.
@@ -305,7 +418,41 @@ impl TaskStore for FsStore {
         for sub in ["attachments", "artifacts", "subtasks"] {
             fs::create_dir_all(dir.join(sub))?;
         }
-        fs::write(dir.join("task.md"), Self::render(&task)?)
+        let path = dir.join("task.md");
+        // Read the file back so the writer's own body survives the rewrite. An unreadable or
+        // absent file simply yields the default tail — a task that cannot be read is not a reason
+        // to refuse to write one.
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        let rendered = Self::render(&task, Self::preserved_tail(&existing))?;
+        Self::write_atomically(&path, &rendered)
+    }
+
+    fn put_if_version(&mut self, task: Task, expected: i64) -> std::io::Result<()> {
+        let dir = self.task_dir(&task.id);
+        for sub in ["attachments", "artifacts", "subtasks"] {
+            fs::create_dir_all(dir.join(sub))?;
+        }
+        let path = dir.join("task.md");
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        let rendered = Self::render(&task, Self::preserved_tail(&existing))?;
+        // Stage first, then check, then publish. The check goes last on purpose: reading the file,
+        // rendering and writing the temp are all slow next to a `rename`, so doing them before the
+        // comparison leaves the smallest possible window in which another writer can land.
+        let staged = Self::stage(&path, &rendered)?;
+        match self.get(&task.id).map(|t| t.version) {
+            Some(v) if v == expected => Self::commit(&staged, &path),
+            other => {
+                let _ = fs::remove_file(&staged);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} is at version {}, not {expected}",
+                        task.id,
+                        other.map_or_else(|| "absent".to_string(), |v| v.to_string())
+                    ),
+                ))
+            }
+        }
     }
 
     fn append_audit(&mut self, entry: AuditEntry) -> std::io::Result<()> {
@@ -322,12 +469,241 @@ impl TaskStore for FsStore {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_mutation_preserves_the_hand_written_body() {
+        // `put` re-rendered the whole file from the Task, so every mutation replaced the body with
+        // a blank template. The docs invite a human to edit these files; this is what makes that
+        // true. Confirmed by experiment before the fix: an edited checklist and note were gone
+        // after a single `task start`.
+        let (_d, mut s) = root();
+        let mut t = task("TASK-0001");
+        t.description = Some("Port the storage layer".into());
+        s.put(t.clone()).unwrap();
+
+        // Stand in for a human editing the file.
+        let path = s.task_dir("TASK-0001").join("task.md");
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("- [ ] \n", "- [x] fsstore round-trips\n- [ ] audit log appends\n")
+            .replace("## Notes\n\n", "## Notes\n\nTalked to Dana; see the sketch.\n");
+        std::fs::write(&path, &edited).unwrap();
+
+        // Any later mutation.
+        t.status = TaskStatus::InReview;
+        t.version = 2;
+        s.put(t).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("- [x] fsstore round-trips"), "criteria kept:\n{after}");
+        assert!(after.contains("- [ ] audit log appends"), "and the added line:\n{after}");
+        assert!(after.contains("Talked to Dana; see the sketch."), "notes kept:\n{after}");
+        assert!(after.contains("status: in-review"), "and the frontmatter still updated:\n{after}");
+    }
+
+    #[test]
+    fn a_description_containing_a_heading_does_not_get_duplicated() {
+        // `description` is rendered inside the Summary section, and the tail scan looked for the
+        // first `## ` heading that was not `## Summary` — so a heading *inside* the description was
+        // taken to be where the writer's body began. `render` then emitted the description again
+        // and appended a tail starting mid-description, duplicating content on every write.
+        let (_d, mut s) = root();
+        let mut t = task("TASK-0001");
+        t.description = Some("Do the thing.\n\n## Risks\n\nIt might not work.".into());
+        s.put(t.clone()).unwrap();
+
+        t.version = 2;
+        s.put(t.clone()).unwrap();
+        t.version = 3;
+        s.put(t).unwrap();
+
+        let after = std::fs::read_to_string(s.task_dir("TASK-0001").join("task.md")).unwrap();
+        let body = after.split_once("\n---\n").unwrap().1;
+        assert_eq!(
+            body.matches("## Risks").count(),
+            1,
+            "the description's own heading must appear once, not once per write:\n{after}"
+        );
+        assert_eq!(
+            body.matches("It might not work.").count(),
+            1,
+            "and neither must its text:\n{after}"
+        );
+        assert_eq!(
+            body.matches("## Acceptance Criteria").count(),
+            1,
+            "and the real tail must still be there exactly once:\n{after}"
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_summary_does_not_duplicate_a_heading_from_the_description() {
+        // The exact-strip path cannot match once a human has edited the Summary text, so the
+        // fallback runs — and the fallback looks for the first `## ` heading, which for a
+        // description containing one is a line inside the description itself. That is the same
+        // duplication bug, in exactly the case this feature exists for: humans editing these files.
+        let (_d, mut s) = root();
+        let mut t = task("TASK-0001");
+        t.description = Some("Do it.\n\n## Risks\n\nMaybe not.".into());
+        s.put(t.clone()).unwrap();
+
+        // A human rewrites the summary prose, leaving everything else alone. Only the BODY: editing
+        // the frontmatter too would keep the stored description in step with it, and the exact-strip
+        // path would still match — which is not the situation being tested.
+        let path = s.task_dir("TASK-0001").join("task.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (front, body) = text.split_once("\n---\n").unwrap();
+        let edited = body.replace("Do it.\n", "Do it, but carefully.\n");
+        assert_ne!(edited, body, "the edit must actually change the body");
+        std::fs::write(&path, format!("{front}\n---\n{edited}")).unwrap();
+
+        for v in 2..5 {
+            t.version = v;
+            s.put(t.clone()).unwrap();
+        }
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let body = after.split_once("\n---\n").unwrap().1;
+        assert_eq!(
+            body.matches("## Risks").count(),
+            1,
+            "the description's heading must not accumulate:\n{after}"
+        );
+        assert_eq!(
+            body.matches("Maybe not.").count(),
+            1,
+            "nor its text:\n{after}"
+        );
+        assert_eq!(
+            body.matches("## Acceptance Criteria").count(),
+            1,
+            "and the writer's tail must survive exactly once:\n{after}"
+        );
+    }
+
+    #[test]
+    fn the_summary_section_still_follows_the_description() {
+        // The counterpart to preserving the body: `## Summary` is generated, so it must not go
+        // stale when the description changes. Preserving the *whole* body would do exactly that.
+        let (_d, mut s) = root();
+        let mut t = task("TASK-0001");
+        t.description = Some("first wording".into());
+        s.put(t.clone()).unwrap();
+
+        t.description = Some("second wording".into());
+        s.put(t).unwrap();
+
+        let after = std::fs::read_to_string(s.task_dir("TASK-0001").join("task.md")).unwrap();
+        assert!(after.contains("second wording"), "summary follows description:\n{after}");
+        assert!(!after.contains("first wording"), "and the old wording is gone:\n{after}");
+    }
+
+    #[test]
+    fn a_body_with_its_own_headings_is_preserved_whole() {
+        // Nothing requires the body to use the template's headings. Whatever the first heading
+        // after Summary is, everything from there down is the writer's and is kept.
+        let (_d, mut s) = root();
+        let mut t = task("TASK-0001");
+        t.description = Some("desc".into());
+        s.put(t.clone()).unwrap();
+        let path = s.task_dir("TASK-0001").join("task.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (front, _) = text.split_once("## Acceptance Criteria").unwrap();
+        std::fs::write(&path, format!("{front}## Design sketch\n\nA then B.\n")).unwrap();
+
+        t.version = 2;
+        s.put(t).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("## Design sketch"), "custom heading kept:\n{after}");
+        assert!(after.contains("A then B."), "and its content:\n{after}");
+    }
+
+    #[test]
+    fn a_reader_never_sees_a_half_written_task() {
+        // `put` wrote in place, so it truncated the file and then filled it. A concurrent reader
+        // landing in that window read no frontmatter, which this store reports as *absent* — the
+        // task blinks out of existence mid-write. Replacing the file by rename removes the window:
+        // a reader sees the whole old file or the whole new one.
+        let d = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(FsStore::new(d.path(), "main"));
+        s.init().unwrap();
+        {
+            let mut w = FsStore::new(d.path(), "main");
+            w.put(task("TASK-0001")).unwrap();
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let s = std::sync::Arc::clone(&s);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut vanished = 0u32;
+                let mut reads = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    reads += 1;
+                    if s.get("TASK-0001").is_none() {
+                        vanished += 1;
+                    }
+                }
+                (reads, vanished)
+            })
+        };
+
+        let mut w = FsStore::new(d.path(), "main");
+        for n in 0..400 {
+            let mut t = task("TASK-0001");
+            t.version = n;
+            t.description = Some(format!("revision {n}"));
+            w.put(t).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (reads, vanished) = reader.join().expect("reader does not panic");
+
+        assert!(reads > 0, "the reader must actually have read something");
+        assert_eq!(
+            vanished, 0,
+            "a task must never read as absent while it is being written ({vanished} of {reads} reads)"
+        );
+    }
+
+    #[test]
+    fn a_conditional_write_is_refused_on_disk_when_the_version_moved() {
+        // The filesystem half of the lost-update guard: it stages the new file, re-reads the stored
+        // version, and only then renames. A refused write must leave the other writer's file and no
+        // staged leftovers.
+        let (_d, mut s) = root();
+        s.put(task("TASK-0001")).unwrap();
+        let mut theirs = task("TASK-0001");
+        theirs.version = 2;
+        theirs.title = "theirs".into();
+        s.put(theirs).unwrap();
+
+        let mut mine = task("TASK-0001");
+        mine.version = 2;
+        mine.title = "mine".into();
+        let err = s
+            .put_if_version(mine, 1)
+            .expect_err("a write computed from version 1 must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(s.get("TASK-0001").unwrap().title, "theirs");
+        let leftovers: Vec<_> = std::fs::read_dir(s.task_dir("TASK-0001"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no staged file may be left: {leftovers:?}");
+    }
+
+    #[test]
     fn a_missing_counter_legitimately_starts_at_one() {
         // The one case where starting over is correct: no counter file has been written yet.
         // Guards the fix below from over-reaching into this path.
         let d = tempfile::tempdir().unwrap();
         let s = FsStore::new(d.path(), "main");
-        assert_eq!(s.next_id().expect("a fresh repository allocates"), "TASK-0001");
+        assert_eq!(
+            s.next_id().expect("a fresh repository allocates"),
+            "TASK-0001"
+        );
     }
 
     #[test]
@@ -338,7 +714,9 @@ mod tests {
         s.put(task("TASK-0001")).unwrap();
         std::fs::write(d.path().join("task_counter.json"), "{ this is not json").unwrap();
 
-        let err = s.next_id().expect_err("a corrupt counter must not silently reset");
+        let err = s
+            .next_id()
+            .expect_err("a corrupt counter must not silently reset");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
         assert!(
             s.get("TASK-0001").is_some(),
@@ -352,7 +730,9 @@ mod tests {
         let (d, s) = root();
         std::fs::write(d.path().join("task_counter.json"), "{\"nxet\":7}").unwrap();
         assert_eq!(
-            s.next_id().expect_err("a counter with no usable next must be reported").kind(),
+            s.next_id()
+                .expect_err("a counter with no usable next must be reported")
+                .kind(),
             std::io::ErrorKind::InvalidData
         );
     }
@@ -458,7 +838,11 @@ mod tests {
         side.put(in_side).unwrap();
 
         assert_eq!(main.get(&a).unwrap().title, "the main one");
-        assert_eq!(side.get(&b).unwrap().title, "the side one", "neither overwrote the other");
+        assert_eq!(
+            side.get(&b).unwrap().title,
+            "the side one",
+            "neither overwrote the other"
+        );
     }
 
     #[test]
@@ -489,7 +873,9 @@ mod tests {
         std::fs::remove_file(&counter).unwrap();
         std::fs::create_dir(&counter).unwrap();
 
-        let err = s.next_id().expect_err("an unreadable counter must be reported");
+        let err = s
+            .next_id()
+            .expect_err("an unreadable counter must be reported");
         assert_ne!(
             err.kind(),
             std::io::ErrorKind::NotFound,
@@ -503,7 +889,10 @@ mod tests {
         // caller would then happily write to disk as a real task.
         let (d, mut s) = root();
         std::fs::write(d.path().join("task_counter.json"), "nonsense").unwrap();
-        assert!(s.allocate_id().is_err(), "a failed allocation must be an error");
+        assert!(
+            s.allocate_id().is_err(),
+            "a failed allocation must be an error"
+        );
     }
 
     use crate::fsstore::*;
@@ -676,15 +1065,18 @@ mod tests {
         let (_d, mut s) = root();
         s.put(task("TASK-0001")).expect("the first write succeeds");
 
-        let f = s.task_dir("TASK-0001").join("task.md");
-        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // The *directory*, not the file. `put` now writes a temp beside `task.md` and renames it,
+        // and `rename` needs write permission on the directory rather than on the target — so
+        // chmodding the file alone no longer refuses anything and this test would assert nothing.
+        let dir = s.task_dir("TASK-0001");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let mut t = task("TASK-0001");
         t.status = TaskStatus::Running;
         let err = s.put(t).expect_err("a refused write is an error");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
 
-        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             s.get("TASK-0001").unwrap().status,
             TaskStatus::Open,

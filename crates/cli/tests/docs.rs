@@ -179,6 +179,56 @@ fn every_top_level_command_is_named_in_the_reference_too() {
     );
 }
 
+/// Every Rust string literal in `source`, with escapes respected.
+///
+/// A `split('"')` and every-other-piece walk gets this wrong. Rust source contains literals like
+/// `"{\"hooks\":[]}"`, whose escaped quotes are not literal boundaries — but `split` treats them as
+/// boundaries, so the odd/even parity flips and stays flipped for the rest of the file. Measured on
+/// `main.rs` when this was replaced: the parity version found nine "codes", three of which were
+/// fragments of prose, and **missed three real ones** — `INVALID_KIND`, `INVALID_PARENT` and
+/// `TASK_UNREADABLE`. A test whose whole job is "no code ships undocumented" had been quietly
+/// letting codes through.
+///
+/// An escape is replaced with a space, which no code contains, so a literal that has one can never
+/// be mistaken for a code. `'"'` — a quote as a char literal — is skipped for the same reason it
+/// broke the old version: it is not a string boundary.
+fn string_literals(source: &str) -> Vec<String> {
+    let b = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        // A quote inside single quotes is a char literal, not the start of a string.
+        if i > 0 && b[i - 1] == b'\'' && i + 1 < b.len() && b[i + 1] == b'\'' {
+            i += 2;
+            continue;
+        }
+        let mut lit = String::new();
+        i += 1;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => {
+                    lit.push(' ');
+                    i += 2;
+                }
+                b'"' => {
+                    i += 1;
+                    break;
+                }
+                c => {
+                    lit.push(c as char);
+                    i += 1;
+                }
+            }
+        }
+        out.push(lit);
+    }
+    out
+}
+
 #[test]
 fn every_code_the_cli_can_emit_is_documented() {
     // Sourced from main.rs rather than from a hand-kept list, so a new code added without a doc
@@ -204,7 +254,8 @@ fn every_code_the_cli_can_emit_is_documented() {
         .collect();
 
     let mut missing = Vec::new();
-    for raw in source.split('"').skip(1).step_by(2) {
+    for raw in string_literals(&source) {
+        let raw = raw.as_str();
         let is_code = raw.len() > 3
             && raw
                 .chars()
@@ -442,5 +493,9 @@ fn no_documented_block_reuses_one_version_across_two_mutations() {
             }
         }
     }
-    assert!(broken.is_empty(), "stale version in a documented example:\n  {}", broken.join("\n  "));
+    assert!(
+        broken.is_empty(),
+        "stale version in a documented example:\n  {}",
+        broken.join("\n  ")
+    );
 }

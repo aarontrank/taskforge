@@ -1420,6 +1420,8 @@ fn run_task(command: TaskCmd, mut store: FsStore, root: &std::path::Path, worksp
 
 fn transition(label: &str, store: FsStore, root: &std::path::Path, a: Act, to: TaskStatus) -> ! {
     let mut svc = TaskService::new(store, now()).with_hooks(HookEngine::new(load_hooks(root)));
+    // Read before the transition, because acceptance is defined by where the task came *from*.
+    let was = svc.store.get(&a.id).map(|t| t.status);
     match svc.set_status(&a.id, to, &a.actor, a.version) {
         Ok(t) => {
             // A recurring completion produces a successor; report it so the caller is not
@@ -1428,12 +1430,45 @@ fn transition(label: &str, store: FsStore, root: &std::path::Path, a: Act, to: T
             if let (Some(obj), Some(next)) = (data.as_object_mut(), svc.last_generated.as_ref()) {
                 obj.insert("next_occurrence_id".into(), serde_json::json!(next));
             }
-            Envelope::ok(label, data)
-                .warn(post_commit_warnings(&svc))
-                .emit()
+            let mut warnings = post_commit_warnings(&svc);
+            // Acceptance is specifically `merged` -> `done`: the step the status model keeps
+            // separate because something still awaits a person. `running` -> `done` via
+            // `task complete` is work that needed no review and is an agent's to finish, so warning
+            // on every arrival at `done` would fire on an expected path and mean nothing.
+            if to == TaskStatus::Done && was == Some(TaskStatus::Merged) {
+                warnings.extend(acceptance_warning(root, &a.actor));
+            }
+            Envelope::ok(label, data).warn(warnings).emit()
         }
         Err(e) => fail(label, e),
     }
+}
+
+/// A warning when a *merged* task is accepted by something other than a human.
+///
+/// Acceptance is a person's call — the status model says `merged` is not terminal precisely because
+/// something still awaits a human — but nothing in the code said so, so an agent could close out its
+/// own work and no record would show that no one had looked. The caller decides when this applies;
+/// it is `merged` -> `done` only, never every arrival at `done`.
+///
+/// Warned rather than refused, deliberately. Refusing would break automation that already
+/// self-accepts, possibly mid-run, to enforce a rule that has never been visible; a warning makes it
+/// visible first and can be tightened later once there is evidence of who actually does this.
+///
+/// An unregistered actor also warns: an unknown name is certainly not a verified human.
+fn acceptance_warning(root: &std::path::Path, actor: &str) -> Option<Message> {
+    let human = load_owners(root)
+        .iter()
+        .any(|o| o.name == actor && o.owner_type == OwnerType::Human);
+    (!human).then(|| {
+        Message::new(
+            "ACCEPTED_WITHOUT_A_HUMAN",
+            format!(
+                "{actor} is not a registered human owner, so this task reached done \
+                 without human acceptance"
+            ),
+        )
+    })
 }
 
 /// Everything that went wrong after the mutation committed.
@@ -1546,10 +1581,24 @@ fn patch(
             );
         }
     }
+    let seen = task.version;
     f(&mut task);
     task.updated_at = now();
     task.version += 1;
-    if let Err(e) = store.put(task.clone()) {
+    // `put_if_version` re-checks against the store immediately before publishing the file. The
+    // guard above ran before this closure did its work, and another writer can land in between —
+    // both would compute the same next version and the later write would silently win.
+    if let Err(e) = store.put_if_version(task.clone(), seen) {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            fail(
+                label,
+                TaskError::VersionMismatch {
+                    id: act.id.clone(),
+                    expected: seen,
+                    actual: store.get(&act.id).map_or(seen, |t| t.version),
+                },
+            );
+        }
         fail(
             label,
             TaskError::Io {

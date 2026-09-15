@@ -1015,13 +1015,19 @@ fn without_json_an_error_goes_to_stderr_with_its_code_and_exits_nonzero() {
 /// Unix-only: it works by dropping the write bit, which is the closest portable stand-in for
 /// the full disk / read-only mount that produces this failure in the wild.
 #[cfg(unix)]
+/// Run `f` with a task whose file cannot be written, to force the IO failure paths.
+///
+/// The **directory** is made read-only, not `task.md` itself. `put` replaces the file by writing a
+/// temp beside it and renaming, and `rename` needs write permission on the directory rather than on
+/// the target — so chmodding the file alone no longer blocks anything, and these tests would pass
+/// while asserting nothing. Blocking the directory stops the temp file being created at all.
 fn with_unwritable_task<T>(root: &std::path::Path, id: &str, f: impl FnOnce() -> T) -> T {
     use std::os::unix::fs::PermissionsExt;
-    let file = root.join("workspaces/main/tasks").join(id).join("task.md");
-    let original = std::fs::metadata(&file).unwrap().permissions();
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let dir = root.join("workspaces/main/tasks").join(id);
+    let original = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     let out = f();
-    std::fs::set_permissions(&file, original).unwrap();
+    std::fs::set_permissions(&dir, original).unwrap();
     out
 }
 
@@ -2393,9 +2399,15 @@ fn a_post_commit_warning_is_visible_without_json() {
     .unwrap();
     let id = mk(d.path(), "hooked");
 
-    let (ok, stdout, stderr) = run_streams(d.path(), &["task", "start", "--id", &id, "--actor", "agent"]);
+    let (ok, stdout, stderr) = run_streams(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent"],
+    );
     assert!(ok, "the transition itself succeeds");
-    assert!(stdout.contains(&id), "the task still renders on stdout: {stdout:?}");
+    assert!(
+        stdout.contains(&id),
+        "the task still renders on stdout: {stdout:?}"
+    );
     assert!(
         stderr.contains("warning:") && stderr.contains("HOOK_FAILED"),
         "the failed hook must be reported to a human too, got stderr {stderr:?}"
@@ -2414,7 +2426,11 @@ fn an_unreadable_task_is_reported_rather_than_treated_as_absent() {
         .join("workspaces/main/tasks")
         .join(&broken)
         .join("task.md");
-    std::fs::write(&path, format!("---\nid: {broken}\nstatus: teleported\n---\n\n")).unwrap();
+    std::fs::write(
+        &path,
+        format!("---\nid: {broken}\nstatus: teleported\n---\n\n"),
+    )
+    .unwrap();
 
     let (ok, r) = run(d.path(), &["task", "show", "--id", &broken, "--json"]);
     assert!(!ok, "an unreadable task is not a success: {r}");
@@ -2425,7 +2441,11 @@ fn an_unreadable_task_is_reported_rather_than_treated_as_absent() {
 
     let (ok, r) = run(d.path(), &["task", "list", "--json"]);
     assert!(ok, "list still works: {r}");
-    assert_eq!(r["data"].as_array().unwrap().len(), 1, "only the readable task: {r}");
+    assert_eq!(
+        r["data"].as_array().unwrap().len(),
+        1,
+        "only the readable task: {r}"
+    );
     assert!(
         r["warnings"]
             .as_array()
@@ -2445,19 +2465,153 @@ fn attach_with_the_current_version_still_succeeds() {
     let src = d.path().join("spec.txt");
     std::fs::write(&src, "hello").unwrap();
     let (_, shown) = run(d.path(), &["task", "show", "--id", &id, "--json"]);
-    let version = shown["data"]["version"].as_i64().expect("a version").to_string();
+    let version = shown["data"]["version"]
+        .as_i64()
+        .expect("a version")
+        .to_string();
 
     let (ok, r) = run(
         d.path(),
         &[
-            "task", "add-attachment", "--id", &id, "--path", src.to_str().unwrap(),
-            "--mode", "copy", "--actor", "agent", "--version", &version, "--json",
+            "task",
+            "add-attachment",
+            "--id",
+            &id,
+            "--path",
+            src.to_str().unwrap(),
+            "--mode",
+            "copy",
+            "--actor",
+            "agent",
+            "--version",
+            &version,
+            "--json",
         ],
     );
     assert!(ok, "the current version must be accepted: {r}");
-    assert_eq!(r["data"]["attachment_refs"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(
+        r["data"]["attachment_refs"].as_array().unwrap().len(),
+        1,
+        "{r}"
+    );
     assert!(
-        d.path().join("workspaces/main/tasks").join(&id).join("attachments/spec.txt").exists(),
+        d.path()
+            .join("workspaces/main/tasks")
+            .join(&id)
+            .join("attachments/spec.txt")
+            .exists(),
         "and the file is copied"
+    );
+}
+
+/// Drive a task all the way to `merged`, ready for acceptance.
+fn merged_task(root: &std::path::Path, actor: &str) -> String {
+    let id = mk(root, "ready to accept");
+    for step in ["start", "request-review", "merge"] {
+        let (ok, r) = run(root, &["task", step, "--id", &id, "--actor", actor, "--json"]);
+        assert!(ok, "{step}: {r}");
+    }
+    id
+}
+
+#[test]
+fn an_agent_reaching_done_is_reported_even_though_it_is_allowed() {
+    // Acceptance is a human's call — that is the documented intent, and the code said nothing about
+    // it, so an agent could close out its own work invisibly. Warned rather than refused: refusing
+    // would break automation mid-run, and the point is to make it visible first.
+    let d = setup();
+    let id = merged_task(d.path(), "agent");
+
+    let (ok, r) = run(
+        d.path(),
+        &["task", "accept", "--id", &id, "--actor", "agent", "--json"],
+    );
+    assert!(ok, "it is still allowed: {r}");
+    assert_eq!(r["data"]["status"], "done", "{r}");
+    assert!(
+        r["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "ACCEPTED_WITHOUT_A_HUMAN"),
+        "but it must be reported: {r}"
+    );
+}
+
+#[test]
+fn a_human_reaching_done_is_not_warned_about() {
+    let d = setup();
+    let (ok, _) = run(
+        d.path(),
+        &["owner", "add", "--name", "aaron", "--type", "human", "--json"],
+    );
+    assert!(ok, "register a human");
+    let id = merged_task(d.path(), "agent");
+
+    let (ok, r) = run(
+        d.path(),
+        &["task", "accept", "--id", &id, "--actor", "aaron", "--json"],
+    );
+    assert!(ok, "{r}");
+    assert!(
+        !r["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "ACCEPTED_WITHOUT_A_HUMAN"),
+        "a human accepting is the expected case: {r}"
+    );
+}
+
+#[test]
+fn a_transition_that_is_not_to_done_is_never_warned_about() {
+    // The warning is about acceptance specifically. Firing it on every agent transition would be
+    // noise on the operations agents are supposed to perform.
+    let d = setup();
+    let id = mk(d.path(), "ordinary work");
+    let (ok, r) = run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+    );
+    assert!(ok, "{r}");
+    assert!(
+        !r["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "ACCEPTED_WITHOUT_A_HUMAN"),
+        "starting work is an agent's job: {r}"
+    );
+}
+
+#[test]
+fn completing_unreviewed_work_is_not_treated_as_acceptance() {
+    // `task complete` is running -> done for work that needed no review, and is a legitimate agent
+    // operation with no human acceptance in the model. Warning on it would fire on an expected
+    // agent path and contradict the warning's own reason for existing. Acceptance is specifically
+    // the step after `merged`.
+    let d = setup();
+    let id = mk(d.path(), "no review needed");
+    let (ok, r) = run(
+        d.path(),
+        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
+    );
+    assert!(ok, "{r}");
+
+    let (ok, r) = run(
+        d.path(),
+        &[
+            "task", "complete", "--id", &id, "--actor", "agent", "--json",
+        ],
+    );
+    assert!(ok, "complete succeeds: {r}");
+    assert_eq!(r["data"]["status"], "done", "{r}");
+    assert!(
+        !r["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "ACCEPTED_WITHOUT_A_HUMAN"),
+        "completing unreviewed work is not an acceptance: {r}"
     );
 }
