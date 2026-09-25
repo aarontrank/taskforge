@@ -2550,10 +2550,10 @@ fn merged_task(root: &std::path::Path, actor: &str) -> String {
 }
 
 #[test]
-fn an_agent_reaching_done_is_reported_even_though_it_is_allowed() {
-    // Acceptance is a human's call — that is the documented intent, and the code said nothing about
-    // it, so an agent could close out its own work invisibly. Warned rather than refused: refusing
-    // would break automation mid-run, and the point is to make it visible first.
+fn an_agent_accepting_a_merged_task_is_not_warned_about() {
+    // The merge IS the acceptance, so an agent accepting is the expected path. Asserting zero
+    // warnings rather than the absence of one code is deliberate: nothing may warn here, or
+    // readers learn to ignore warnings.
     let d = setup();
     let id = merged_task(d.path(), "agent");
 
@@ -2561,94 +2561,11 @@ fn an_agent_reaching_done_is_reported_even_though_it_is_allowed() {
         d.path(),
         &["task", "accept", "--id", &id, "--actor", "agent", "--json"],
     );
-    assert!(ok, "it is still allowed: {r}");
+    assert!(ok, "{r}");
     assert_eq!(r["data"]["status"], "done", "{r}");
-    assert!(
-        r["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w["code"] == "ACCEPTED_WITHOUT_A_HUMAN"),
-        "but it must be reported: {r}"
-    );
-}
-
-#[test]
-fn a_human_reaching_done_is_not_warned_about() {
-    let d = setup();
-    let (ok, _) = run(
-        d.path(),
-        &[
-            "owner", "add", "--name", "aaron", "--type", "human", "--json",
-        ],
-    );
-    assert!(ok, "register a human");
-    let id = merged_task(d.path(), "agent");
-
-    let (ok, r) = run(
-        d.path(),
-        &["task", "accept", "--id", &id, "--actor", "aaron", "--json"],
-    );
-    assert!(ok, "{r}");
-    assert!(
-        !r["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w["code"] == "ACCEPTED_WITHOUT_A_HUMAN"),
-        "a human accepting is the expected case: {r}"
-    );
-}
-
-#[test]
-fn a_transition_that_is_not_to_done_is_never_warned_about() {
-    // The warning is about acceptance specifically. Firing it on every agent transition would be
-    // noise on the operations agents are supposed to perform.
-    let d = setup();
-    let id = mk(d.path(), "ordinary work");
-    let (ok, r) = run(
-        d.path(),
-        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
-    );
-    assert!(ok, "{r}");
-    assert!(
-        !r["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w["code"] == "ACCEPTED_WITHOUT_A_HUMAN"),
-        "starting work is an agent's job: {r}"
-    );
-}
-
-#[test]
-fn completing_unreviewed_work_is_not_treated_as_acceptance() {
-    // `task complete` is running -> done for work that needed no review, and is a legitimate agent
-    // operation with no human acceptance in the model. Warning on it would fire on an expected
-    // agent path and contradict the warning's own reason for existing. Acceptance is specifically
-    // the step after `merged`.
-    let d = setup();
-    let id = mk(d.path(), "no review needed");
-    let (ok, r) = run(
-        d.path(),
-        &["task", "start", "--id", &id, "--actor", "agent", "--json"],
-    );
-    assert!(ok, "{r}");
-
-    let (ok, r) = run(
-        d.path(),
-        &[
-            "task", "complete", "--id", &id, "--actor", "agent", "--json",
-        ],
-    );
-    assert!(ok, "complete succeeds: {r}");
-    assert_eq!(r["data"]["status"], "done", "{r}");
-    assert!(
-        !r["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w["code"] == "ACCEPTED_WITHOUT_A_HUMAN"),
-        "completing unreviewed work is not an acceptance: {r}"
+    assert_eq!(
+        r["warnings"].as_array().unwrap().len(),
+        0,
+        "an agent accepting a merged task is the expected path: {r}"
     );
 }

@@ -34,7 +34,6 @@ context. Currently emitted:
 | `AUDIT_WRITE_FAILED` | The change is stored; its `audit.log` line is not. Also raised when a recurring task's *successor* was written but its audit line was not — the successor exists and is reported in `next_occurrence_id`, so do not re-create it | — |
 | `RECURRENCE_WRITE_FAILED` | A recurring task completed and its successor genuinely was **not** written | — |
 | `TASK_UNREADABLE` | On `task list`: named tasks are omitted because their `task.md` cannot be read. They exist — they are not deleted — so the list is incomplete rather than authoritative | — |
-| `ACCEPTED_WITHOUT_A_HUMAN` | A **`merged`** task was accepted and the actor is not a registered **human** owner. The transition is allowed; this records that nobody confirmed the work. Acceptance is a person's decision — that is why `merged` is not terminal. `task complete` (`running` → `done`, work needing no review) never raises this: it is not an acceptance | — |
 
 ```json
 {
@@ -115,7 +114,7 @@ Each takes `--id`, `--actor`, optional `--version <n>` for optimistic concurrenc
 | `task request-review` | running, waiting-on-schedule, stuck | → in-review |
 | `task reject` | in-review | → changes-requested. Feedback landed |
 | `task merge` | in-review | → merged. **Not** terminal |
-| `task accept` | merged, running | → done. Human acceptance; the only success terminal. From `running` only when no review was demanded |
+| `task accept` | merged, running | → done. The merge is the acceptance, so run this as soon as the review merges; the only success terminal. From `running` only when no review was demanded |
 | `task complete` | running, merged | → done. Fails with `REVIEW_REQUIRED` if review was demanded and the task never went through it |
 | `task pending` | open, stuck | → pending. Planned into a wave, not yet dispatched |
 | `task wait` | running, stuck | → waiting-on-schedule. Slow non-review step, still on schedule |

@@ -42,9 +42,11 @@ open ─→ pending ─→ running ─→ in-review ─→ merged ─→ done
                       └→ stuck / failed
 ```
 
-- **`merged` is NOT done.** A merged review still awaits human acceptance. Moving to `done`
-  is `task accept`, and that is a *human's* call — do not accept your own work unless asked.
-- **`done` means merged AND accepted.** It is the only success terminal.
+- **`merged` is a step, not a resting state.** The merge **is** the acceptance, so run
+  `task accept` as soon as the review merges — whoever merged it — and never leave a task here
+  waiting for someone to confirm. Nothing warns about an agent doing this; it is the normal path.
+- **`done` is the only success terminal**, reached two ways: `task accept` after a merge, or
+  `task complete` for work that needed no review. Not every `done` task passed through `merged`.
 
 Consequences you will hit:
 
@@ -86,8 +88,9 @@ taskforge task list --overdue --json      # past its expected_by
 taskforge task list --stale 7d --json     # untouched for over a week
 ```
 
-Both skip finished tasks and both *include* `merged` — the state that rots while waiting on a
-human to accept it. Use these instead of eyeballing the whole board.
+Both skip finished tasks and both *include* `merged`, which should now be transient — a task
+found resting there is one whose `task accept` was missed. Use these instead of eyeballing the
+whole board.
 
 If either of those errors with *unexpected argument*, **do not conclude the flag does not exist**:
 

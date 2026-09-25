@@ -11,7 +11,9 @@
 //! every mutation byte-for-byte.
 //!
 //! Replacement is atomic — a temp file and a rename — so a concurrent reader never sees a task
-//! mid-write. See [`FsStore::write_atomically`] for what that measured before it was fixed.
+//! mid-write. `write_atomically` records what that measured before it was fixed; it is deliberately
+//! named without a doc link, because it is private and linking to it from a public module doc leaves
+//! a dead reference in the generated documentation.
 
 use crate::model::Task;
 use crate::store::{AuditEntry, TaskStore};

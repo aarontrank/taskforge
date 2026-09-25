@@ -13,8 +13,10 @@ Written in Rust. No runtime, no daemon, no database, no Node.
 Most trackers let anything move to "done". TaskForge encodes the two distinctions that
 actually matter when agents are doing the work:
 
-- **`merged` is not `done`.** A merged review still awaits human acceptance.
-- **`done` means merged *and* accepted.** It is the only success terminal.
+- **`merged` is a step, not a resting state.** The merge **is** the acceptance, so `task accept`
+  follows it at once — whoever merged the review.
+- **`done` is the only success terminal**, reached by `task accept` after a merge or by
+  `task complete` for work that needed no review.
 
 That falls out into enforcement you feel immediately: a blocker sitting in `merged` does **not**
 release the task waiting on it, and `task complete` on a review-required task is refused. The
@@ -236,7 +238,7 @@ so `reviews` is a list. Files written when it was singular still load and migrat
 `expected_by`; `task list --stale 7d` catches anything untouched for longer than an age
 (`12h`/`7d`/`2w`, or a bare number of days). Both skip the terminal statuses — a task finished in
 January has not moved since, and that is correct — and both *include* `merged`, which is the state
-that rots while waiting on a human to accept it.
+that rots when a `task accept` is missed.
 
 **Hooks.** Local commands fired *after* a mutation commits, configured in `config.json`, with
 the event payload on stdin. A hook that fails, hangs, or does not exist never rolls the change

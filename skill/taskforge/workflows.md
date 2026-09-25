@@ -38,8 +38,8 @@ taskforge task start       --id TASK-0001 --actor agent --json   # changes-reque
 When the review merges:
 
 ```bash
-taskforge task merge  --id TASK-0001 --actor agent --json   # merged: NOT done
-taskforge task accept --id TASK-0001 --actor aaron --json   # done: the human accepts
+taskforge task merge  --id TASK-0001 --actor agent --json   # merged: transient
+taskforge task accept --id TASK-0001 --actor agent --json   # done: the merge IS the acceptance
 ```
 
 ## Reporting a genuine block
@@ -78,7 +78,7 @@ taskforge task list --overdue --json       # and these blew their expected_by
 
 Neither is a problem report on its own. Read each one and decide: resume it, `block` it if it
 needs a decision, or `accept` it if the review actually merged and only the bookkeeping is
-missing. A `merged` task showing up here means it is waiting on a human, not stuck.
+missing. A `merged` task showing up here means its `accept` was missed, not that it is stuck.
 
 ## Classifying work as you go
 

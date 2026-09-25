@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 /// These are the eleven values the `orchestrate` skill's status board uses, so a taskforge
 /// task can express the distinctions that board exists to make. Two matter most:
 ///
-/// * `Merged` is **not** terminal. A merged review still awaits human acceptance.
-/// * `Done` means merged **and** accepted. It is the only success terminal.
+/// * `Merged` is **not** terminal, but it is transient: the merge is the acceptance, so
+///   `accept` follows it at once rather than waiting on a further signal.
+/// * `Done` is the only success terminal.
 ///
 /// `Open` is retained as the initial state a freshly created task carries; `Pending` is the
 /// planned-but-not-dispatched state used once a task is part of a wave.
@@ -698,9 +699,9 @@ updated_at: 2026-09-03T00:00:00Z
     }
 
     #[test]
-    fn a_merged_task_can_go_stale_because_it_is_waiting_on_a_human() {
-        // The reason merged is excluded from is_terminal: it is exactly the state that rots
-        // silently while waiting to be accepted.
+    fn a_merged_task_can_go_stale_because_it_is_not_terminal() {
+        // The reason merged is excluded from is_terminal: it should be transient, so a task found
+        // resting there is one whose accept was missed, and staleness is how that surfaces.
         let mut t = Task::new("TASK-0001", "t", "main", "a", "2026-08-01T00:00:00Z");
         t.status = TaskStatus::Merged;
         t.updated_at = "2026-08-01T00:00:00Z".into();

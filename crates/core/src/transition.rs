@@ -66,7 +66,7 @@ mod tests {
         (ChangesRequested, Running),
         (ChangesRequested, Stuck),
         (ChangesRequested, Failed),
-        // Merged is NOT terminal: it awaits human acceptance.
+        // Merged is NOT terminal, but it is transient: accept follows the merge at once.
         (Merged, Done),
         (Merged, Failed),
         // Slow non-review step in flight.
