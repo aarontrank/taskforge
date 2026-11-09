@@ -21,15 +21,29 @@ fn main() {
     // enough: an ordinary commit moves the *branch ref* and leaves `HEAD` reading
     // `ref: refs/heads/main` untouched, so watching only HEAD misses every commit that is not a
     // checkout.
-    if let Some(git_dir) = root.as_ref().map(|r| r.join(".git")) {
+    //
+    // `HEAD` is in the git dir, branch refs and `packed-refs` in the common dir. They differ in a
+    // linked worktree, where a wrong path watches nothing and the commit silently stays old.
+    if let (Some(git_dir), Some(common_dir)) = (git_path("--git-dir"), git_path("--git-common-dir"))
+    {
         rerun_if_changed(&git_dir.join("HEAD"));
         // Loose ref for the current branch, and packed-refs for when it has been packed away.
+        // A packed branch has no loose ref until the next commit creates one, so watch the
+        // nearest directory under `refs/` that does exist; cargo scans a directory recursively.
         if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
             if let Some(reference) = head.strip_prefix("ref: ") {
-                rerun_if_changed(&git_dir.join(reference.trim()));
+                let loose = common_dir.join(reference.trim());
+                let refs = common_dir.join("refs");
+                if let Some(watch) = loose.ancestors().find(|a| a.exists()) {
+                    if watch.starts_with(&refs) {
+                        rerun_if_changed(watch);
+                    }
+                }
             }
         }
-        rerun_if_changed(&git_dir.join("packed-refs"));
+        rerun_if_changed(&common_dir.join("packed-refs"));
+        // A reftable repository keeps every ref here instead, and its `HEAD` never changes.
+        rerun_if_changed(&common_dir.join("reftable"));
     }
 
     let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
@@ -51,6 +65,11 @@ fn rerun_if_changed(p: &std::path::Path) {
 /// The checkout this build came from, so `doctor` knows where to look for newer commits.
 fn repo_root() -> Option<std::path::PathBuf> {
     git(&["rev-parse", "--show-toplevel"]).map(std::path::PathBuf::from)
+}
+
+/// A directory `git rev-parse <flag>` names. Git may answer relative to where it ran.
+fn git_path(flag: &str) -> Option<std::path::PathBuf> {
+    git(&["rev-parse", flag]).map(|p| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p))
 }
 
 /// Run git in the crate directory, or `None` if it is unavailable or reports failure.
