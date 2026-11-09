@@ -22,9 +22,8 @@ fn main() {
     // `ref: refs/heads/main` untouched, so watching only HEAD misses every commit that is not a
     // checkout.
     //
-    // In a linked worktree `<root>/.git` is a file, `HEAD` is in the worktree's own git dir and
-    // the branch refs and `packed-refs` are in the common dir; assuming `<root>/.git/` there
-    // watches nothing and the commit silently stays old. Ask git for both directories instead.
+    // `HEAD` is in the git dir, branch refs and `packed-refs` in the common dir. They differ in a
+    // linked worktree, where a wrong path watches nothing and the commit silently stays old.
     if let (Some(git_dir), Some(common_dir)) = (git_path("--git-dir"), git_path("--git-common-dir"))
     {
         rerun_if_changed(&git_dir.join("HEAD"));
@@ -43,6 +42,8 @@ fn main() {
             }
         }
         rerun_if_changed(&common_dir.join("packed-refs"));
+        // A reftable repository keeps every ref here instead, and its `HEAD` never changes.
+        rerun_if_changed(&common_dir.join("reftable"));
     }
 
     let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
