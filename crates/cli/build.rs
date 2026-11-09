@@ -21,15 +21,20 @@ fn main() {
     // enough: an ordinary commit moves the *branch ref* and leaves `HEAD` reading
     // `ref: refs/heads/main` untouched, so watching only HEAD misses every commit that is not a
     // checkout.
-    if let Some(git_dir) = root.as_ref().map(|r| r.join(".git")) {
+    //
+    // In a linked worktree `<root>/.git` is a file, `HEAD` is in the worktree's own git dir and
+    // the branch refs and `packed-refs` are in the common dir; assuming `<root>/.git/` there
+    // watches nothing and the commit silently stays old. Ask git for both directories instead.
+    if let (Some(git_dir), Some(common_dir)) = (git_path("--git-dir"), git_path("--git-common-dir"))
+    {
         rerun_if_changed(&git_dir.join("HEAD"));
         // Loose ref for the current branch, and packed-refs for when it has been packed away.
         if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
             if let Some(reference) = head.strip_prefix("ref: ") {
-                rerun_if_changed(&git_dir.join(reference.trim()));
+                rerun_if_changed(&common_dir.join(reference.trim()));
             }
         }
-        rerun_if_changed(&git_dir.join("packed-refs"));
+        rerun_if_changed(&common_dir.join("packed-refs"));
     }
 
     let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
@@ -51,6 +56,11 @@ fn rerun_if_changed(p: &std::path::Path) {
 /// The checkout this build came from, so `doctor` knows where to look for newer commits.
 fn repo_root() -> Option<std::path::PathBuf> {
     git(&["rev-parse", "--show-toplevel"]).map(std::path::PathBuf::from)
+}
+
+/// A directory `git rev-parse <flag>` names. Git may answer relative to where it ran.
+fn git_path(flag: &str) -> Option<std::path::PathBuf> {
+    git(&["rev-parse", flag]).map(|p| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p))
 }
 
 /// Run git in the crate directory, or `None` if it is unavailable or reports failure.
