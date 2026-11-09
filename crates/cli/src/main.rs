@@ -336,6 +336,8 @@ fn task_detail(t: &serde_json::Value) -> String {
         ("ticket", "ticket"),
         ("review required", "review_required"),
         ("reviewer", "reviewer"),
+        ("review outcome", "review_outcome"),
+        ("reviewed at", "reviewed_at"),
         ("expected by", "expected_by"),
         ("worker", "worker"),
         ("checkout", "checkout"),
