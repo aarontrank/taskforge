@@ -8,7 +8,7 @@ use crate::transition::can_transition;
 pub enum TaskError {
     #[error("task not found: {0}")]
     NotFound(String),
-    #[error("cannot move {id} from {from} to {to}")]
+    #[error("cannot move {id} from {from} to {to}; {}", crate::transition::reachable_from(*from, *to))]
     InvalidTransition {
         id: String,
         from: TaskStatus,
@@ -413,6 +413,48 @@ mod tests {
             .set_status("TASK-0001", TaskStatus::Merged, "agent", None)
             .unwrap_err();
         assert_eq!(err.code(), "INVALID_STATUS_TRANSITION", "got: {err}");
+    }
+
+    #[test]
+    fn a_refused_transition_names_the_statuses_the_target_is_reachable_from() {
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap(); // Open
+        let err = s
+            .set_status("TASK-0001", TaskStatus::Stuck, "agent", None)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot move TASK-0001 from open to stuck; stuck is reachable only from \
+             pending, running, in-review, changes-requested, waiting-on-schedule"
+        );
+    }
+
+    #[test]
+    fn a_move_to_the_current_status_says_the_task_is_already_there() {
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap(); // Open
+        let err = s
+            .set_status("TASK-0001", TaskStatus::Open, "agent", None)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot move TASK-0001 from open to open; it is already open"
+        );
+    }
+
+    #[test]
+    fn a_refused_move_to_a_status_nothing_reaches_says_so() {
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap(); // Open
+        s.set_status("TASK-0001", TaskStatus::Pending, "agent", None)
+            .unwrap();
+        let err = s
+            .set_status("TASK-0001", TaskStatus::Open, "agent", None)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot move TASK-0001 from pending to open; no status moves to open"
+        );
     }
 
     #[test]

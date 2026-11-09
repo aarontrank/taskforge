@@ -16,6 +16,7 @@ use taskforge_core::model::{
 };
 use taskforge_core::service::{TaskError, TaskService};
 use taskforge_core::store::{AuditEntry, TaskStore};
+use taskforge_core::transition::{legal_sources, legal_targets};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -227,6 +228,27 @@ fn require_date(label: &str, flag: &str, value: Option<&String>) {
         ),
     )
     .emit()
+}
+
+fn names(statuses: impl IntoIterator<Item = TaskStatus>) -> String {
+    let names: Vec<&str> = statuses.into_iter().map(|s| s.as_str()).collect();
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn legal_from_help(to: TaskStatus) -> String {
+    format!("Legal from: {}", names(legal_sources(to)))
+}
+
+fn legal_moves_help() -> String {
+    let moves: Vec<String> = TaskStatus::ALL
+        .into_iter()
+        .map(|from| format!("  {from} -> {}", names(legal_targets(from))))
+        .collect();
+    format!("Legal moves:\n{}", moves.join("\n"))
 }
 
 /// An unknown-kind message that names the whole legal set, so the fix is in the error.
@@ -501,30 +523,42 @@ enum TaskCmd {
         #[arg(long)]
         stale: Option<String>,
     },
-    /// open|pending -> running
+    /// -> running
+    #[command(after_help = legal_from_help(TaskStatus::Running))]
     Start(Act),
-    /// running -> in-review
+    /// -> in-review
+    #[command(after_help = legal_from_help(TaskStatus::InReview))]
     RequestReview(Act),
     /// in-review -> merged
+    #[command(after_help = legal_from_help(TaskStatus::Merged))]
     Merge(Act),
-    /// merged -> done (the merge is the acceptance; the only success terminal)
+    /// -> done: the merge is the acceptance; the only success terminal
+    #[command(after_help = legal_from_help(TaskStatus::Done))]
     Accept(Act),
-    /// running -> done, for work that needs no review
+    /// -> done, for work that needs no review
+    #[command(after_help = legal_from_help(TaskStatus::Done))]
     Complete(Act),
     /// in-review -> changes-requested
+    #[command(after_help = legal_from_help(TaskStatus::ChangesRequested))]
     Reject(Act),
     /// -> pending: planned into a wave, not yet dispatched
+    #[command(after_help = legal_from_help(TaskStatus::Pending))]
     Pending(Act),
     /// -> waiting-on-schedule: in flight on a slow non-review step, still on schedule
+    #[command(after_help = legal_from_help(TaskStatus::WaitingOnSchedule))]
     Wait(Act),
     /// -> stuck: needs a decision, or a wait has passed its expected-by
+    #[command(after_help = legal_from_help(TaskStatus::Stuck))]
     Block(Act),
     /// -> failed: attempted and failed. May be retried with `start`
+    #[command(after_help = legal_from_help(TaskStatus::Failed))]
     Fail(Act),
     /// -> cancelled: will never run, e.g. a dependency failed permanently
+    #[command(after_help = legal_from_help(TaskStatus::Cancelled))]
     Cancel(Act),
     /// Move to any status by name. Guarded by the same transition table as the named
     /// commands, so this is a shorthand rather than a way around them.
+    #[command(after_help = legal_moves_help())]
     SetStatus {
         #[command(flatten)]
         act: Act,
