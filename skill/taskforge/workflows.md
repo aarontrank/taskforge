@@ -24,16 +24,17 @@ taskforge task set-review     --id TASK-0001 --actor agent --json \
 Then **stop**. The task is `in-review` and inside its window: waiting, not stuck. Do not poll
 it aggressively, do not escalate, and do not move it yourself.
 
-When feedback arrives:
+When feedback arrives — the reviewer sent it back, and you are the one recording it:
 
 ```bash
-taskforge task add-comment --id TASK-0001 --actor aaron --text "Missing error schema" --json
-taskforge task reject      --id TASK-0001 --actor aaron --json
+taskforge task add-comment --id TASK-0001 --actor agent --text "Reviewer (aaron) on PR-4821: missing error schema" --json
+taskforge task reject      --id TASK-0001 --actor agent --json
 taskforge task start       --id TASK-0001 --actor agent --json   # changes-requested -> running
 ```
 
 `reject` records the transition, not the reason — it takes no `--text`. Put the feedback in
-`add-comment` first, so the task carries why it came back.
+`add-comment` first, so the task carries why it came back. `--actor` is you, the one running the
+command; the reviewer's name goes in the text.
 
 When the review merges:
 
@@ -48,7 +49,7 @@ taskforge task accept --id TASK-0001 --actor agent --json   # done: the merge IS
 taskforge task add-comment --id TASK-0001 --actor agent --text "Needs a decision on X." --json
 ```
 
-Then set it `stuck` only if it truly cannot proceed, or its `expected_by` has passed. `stuck` is
+Then `block` it (→ `stuck`) only if it truly cannot proceed, or its `expected_by` has passed. `stuck` is
 a request for human attention — using it for an ordinary wait trains everyone to ignore it.
 
 ## Breaking work down
@@ -96,8 +97,10 @@ reportable as such, whereas a wrong kind is a wrong number in a report nobody wi
 When more than one agent may touch a task, pass the version you read. This works on **every**
 mutating command — the status transitions and the field setters alike:
 
-**Re-read the version before every mutation.** Each one bumps it, so reusing a captured value for
-a second command is guaranteed to fail with `CONFLICT_VERSION_MISMATCH`.
+**Pass the current version to every mutation.** Each one bumps it, so reusing a value captured
+before your own last mutation is guaranteed to fail with `CONFLICT_VERSION_MISMATCH`. The current
+version is the one in your latest `task show`, or in the `data` of your own last mutation's
+response. `add-worklog` and `add-comment` do not bump it.
 
 ```bash
 read_version() {
@@ -114,20 +117,27 @@ retry blindly in a loop.
 
 ## Abandoning work in flight
 
-`cancel` is refused from `running` and `in-review`. Dropping live work is two steps:
+`cancel` is refused from `running` and `in-review`. Dropping live work is two steps, after the
+person has said yes to the exact list of tasks (`cancelled` is final):
 
 ```bash
-taskforge task add-comment --id TASK-0001 --actor aaron --text "Premise changed; dropping." --json
-taskforge task block       --id TASK-0001 --actor aaron --json   # -> stuck
-taskforge task cancel      --id TASK-0001 --actor aaron --json   # -> cancelled
+taskforge task add-comment --id TASK-0001 --actor agent --text "Premise changed; dropping." --json
+taskforge task block       --id TASK-0001 --actor agent --json   # -> stuck
+taskforge task cancel      --id TASK-0001 --actor agent --json   # -> cancelled
 ```
+
+A review still open in the review tool is not closed by this: say so, and close it there or ask
+who will.
 
 If the review already **merged**, this does not work — `block` and `cancel` are both refused, and
 the only moves left are `accept` and `fail`. Abandon it with `fail`:
 
 ```bash
-taskforge task fail --id TASK-0001 --actor aaron --json   # merged -> failed
+taskforge task fail --id TASK-0001 --actor agent --json   # merged -> failed
 ```
+
+If the merged work is staying in the codebase, it was not abandoned: `accept` it instead, so the
+board says what happened.
 
 ## When a command succeeds but warns
 

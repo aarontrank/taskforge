@@ -21,8 +21,11 @@ You drive tasks through the `taskforge` CLI. Data lives in `~/.taskforge` (overr
    `version`, `blocked_by`, and `review_required` you are about to act against.
 4. **Never edit `task.md` by hand.** Use the patch commands. Hand edits bypass the audit log,
    the version counter, and every guard below.
-5. **Pass `--actor <you>`** on mutations. Every command that accepts it records it in the audit
-   log, against the name of the action — so `task audit` answers who changed what.
+5. **Pass `--actor <you>`** on mutations — the name of whoever runs the command, which is you, even
+   when you are recording something another person did (their review sent it back, they merged
+   it). Every command that accepts it records it in the audit log, against the name of the action —
+   so `task audit` answers who changed the record. Say who did the real-world thing in an
+   `add-comment` or `add-worklog` text ("Priya merged PR-12"); `--actor` is not that field.
 6. **Log your work** with `task add-worklog` after meaningful progress — what was done, what
    remains, what blocked you. Worklogs are execution records; `add-comment` is discussion.
 7. **On `CONFLICT_VERSION_MISMATCH`,** re-read the task and retry only if the action still
@@ -45,6 +48,9 @@ open ─→ pending ─→ running ─→ in-review ─→ merged ─→ done
 - **`merged` is a step, not a resting state.** The merge **is** the acceptance, so run
   `task accept` as soon as the review merges — whoever merged it — and never leave a task here
   waiting for someone to confirm. Nothing warns about an agent doing this; it is the normal path.
+  A task whose status is already `merged` is the record that its review merged: accepting it
+  needs no further check and no one's permission. When you learn a review merged in the review
+  tool and the task is still `in-review`, `task merge` is how you record it, then `task accept`.
 - **`done` is the only success terminal**, reached two ways: `task accept` after a merge, or
   `task complete` for work that needed no review. Not every `done` task passed through `merged`.
 
@@ -56,6 +62,14 @@ Consequences you will hit:
   `task request-review` instead.
 - `in-review` within its `expected_by` window is **waiting, not stuck**. Do not escalate it and
   do not mark it `stuck`. Only a wait that has passed `expected_by` is `stuck`.
+- **`done` and `cancelled` are final.** No command moves a task out of either, so neither can
+  be undone. Before cancelling, show the person the exact tasks (id and title) you are about to
+  cancel and get a yes — above all when the request picks them by a tag, a search or a description,
+  which can match more than they meant.
+- **`block`, `reject` and `cancel` take no reason.** Run `task add-comment` with the why
+  *before* the transition; otherwise the task records that it moved and never why. `stuck` is
+  how you ask for a human: block a task only after commenting what decision or chase it needs.
+  The one exception is the `block` on the way to `cancel` below, which is a step, not a request.
 - **In-flight work cannot be cancelled directly.** `cancel` is legal only from `open`,
   `pending`, `stuck`, and `failed`. To abandon a `running` or `in-review` task, `block` it first
   (→ `stuck`), then `cancel`. Deliberate: it makes dropping live work a two-step decision. Once a
@@ -75,7 +89,8 @@ crossing package boundaries needs one each) and `expected_by`
 (which dev workspace they hold it in) via `task set-worker`. Note `checkout` is the *development*
 workspace — distinct from the global `--workspace` flag, which selects a taskforge partition.
 
-Three fields say what the work *is*, for reporting: `kind` (a **closed** set — `feature`, `bug`,
+Three fields say what the work *is*, for reporting (`task list` has no filter on any of them:
+list with `--json` and select on the field yourself): `kind` (a **closed** set — `feature`, `bug`,
 `chore`, `investigation`, `oncall`, `doc`; anything else is `INVALID_KIND`), `tags` (open-ended
 projects and themes), and `ticket` (the external tracker item, an opaque string). Set them at
 creation with `--kind`/`--ticket`/`--tag` or later with `set-kind`/`set-ticket`/`add-tag`. A task
@@ -99,6 +114,8 @@ taskforge doctor --json                   # state: fresh | stale | unknown
 ```
 
 `stale` means the installed binary predates the source and `note` carries the reinstall command.
+A stale binary still runs every command it has, so carry on with those. Reinstalling is the
+person's call: tell them, with the `note`, rather than running it yourself.
 These two flags shipped and then sat unreachable for a week for exactly that reason, while
 `--version` reported the same number for both builds. One command settles it.
 
@@ -116,8 +133,12 @@ taskforge owner add --name <name> --type human|agent --json   # if the one you n
 
 ## The loop
 
+A `pending` task is ready only when every task in its `blocked_by` is `done`. A blocker stays
+listed in `blocked_by` after it is done, so check each blocker's status rather than the list
+being empty — `task start` makes the same check and refuses with `BLOCKED_BY_OPEN_TASK`.
+
 ```bash
-taskforge task list --status pending --json          # what is ready
+taskforge task list --status pending --json          # candidates; check blocked_by
 taskforge task show --id TASK-0001 --json            # inspect before acting
 taskforge task start --id TASK-0001 --actor me --json
 taskforge task add-worklog --id TASK-0001 --actor me --text "Ported storage. Next: hooks." --json
