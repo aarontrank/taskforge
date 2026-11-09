@@ -2569,3 +2569,51 @@ fn an_agent_accepting_a_merged_task_is_not_warned_about() {
         "an agent accepting a merged task is the expected path: {r}"
     );
 }
+
+#[test]
+fn transition_help_names_the_statuses_each_command_is_legal_from() {
+    use taskforge_core::model::TaskStatus;
+    use taskforge_core::transition::can_transition;
+    for (cmd, to) in [
+        ("pending", TaskStatus::Pending),
+        ("wait", TaskStatus::WaitingOnSchedule),
+        ("block", TaskStatus::Stuck),
+        ("fail", TaskStatus::Failed),
+        ("cancel", TaskStatus::Cancelled),
+    ] {
+        let from: Vec<&str> = TaskStatus::ALL
+            .into_iter()
+            .filter(|&f| can_transition(f, to))
+            .map(|f| f.as_str())
+            .collect();
+        let out = Command::new(env!("CARGO_BIN_EXE_taskforge"))
+            .args(["task", cmd, "--help"])
+            .output()
+            .unwrap();
+        let help = String::from_utf8(out.stdout).unwrap();
+        let line = format!("Legal from: {}", from.join(", "));
+        assert!(
+            help.contains(&line),
+            "`task {cmd} --help` lacks {line:?}:\n{help}"
+        );
+    }
+}
+
+#[test]
+fn set_status_help_lists_every_legal_move() {
+    let out = Command::new(env!("CARGO_BIN_EXE_taskforge"))
+        .args(["task", "set-status", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8(out.stdout).unwrap();
+    for line in [
+        "open -> pending, running, cancelled",
+        "running -> in-review, waiting-on-schedule, stuck, done, failed",
+        "done -> (none)",
+    ] {
+        assert!(
+            help.contains(line),
+            "set-status --help lacks {line:?}:\n{help}"
+        );
+    }
+}

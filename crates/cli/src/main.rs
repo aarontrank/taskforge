@@ -16,6 +16,7 @@ use taskforge_core::model::{
 };
 use taskforge_core::service::{TaskError, TaskService};
 use taskforge_core::store::{AuditEntry, TaskStore};
+use taskforge_core::transition::{can_transition, legal_sources};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -230,6 +231,32 @@ fn require_date(label: &str, flag: &str, value: Option<&String>) {
 }
 
 /// An unknown-kind message that names the whole legal set, so the fix is in the error.
+fn names(statuses: impl IntoIterator<Item = TaskStatus>) -> String {
+    let names: Vec<&str> = statuses.into_iter().map(|s| s.as_str()).collect();
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn legal_from_help(to: TaskStatus) -> String {
+    format!("Legal from: {}", names(legal_sources(to)))
+}
+
+fn legal_moves_help() -> String {
+    let moves: Vec<String> = TaskStatus::ALL
+        .into_iter()
+        .map(|from| {
+            let to = TaskStatus::ALL
+                .into_iter()
+                .filter(|&to| can_transition(from, to));
+            format!("  {from} -> {}", names(to))
+        })
+        .collect();
+    format!("Legal moves:\n{}", moves.join("\n"))
+}
+
 fn kind_message(e: &taskforge_core::model::UnknownKind) -> String {
     let legal: Vec<&str> = TaskKind::ALL.iter().map(|k| k.as_str()).collect();
     format!("{e}; expected one of: {}", legal.join(", "))
@@ -514,17 +541,23 @@ enum TaskCmd {
     /// in-review -> changes-requested
     Reject(Act),
     /// -> pending: planned into a wave, not yet dispatched
+    #[command(after_help = legal_from_help(TaskStatus::Pending))]
     Pending(Act),
     /// -> waiting-on-schedule: in flight on a slow non-review step, still on schedule
+    #[command(after_help = legal_from_help(TaskStatus::WaitingOnSchedule))]
     Wait(Act),
     /// -> stuck: needs a decision, or a wait has passed its expected-by
+    #[command(after_help = legal_from_help(TaskStatus::Stuck))]
     Block(Act),
     /// -> failed: attempted and failed. May be retried with `start`
+    #[command(after_help = legal_from_help(TaskStatus::Failed))]
     Fail(Act),
     /// -> cancelled: will never run, e.g. a dependency failed permanently
+    #[command(after_help = legal_from_help(TaskStatus::Cancelled))]
     Cancel(Act),
     /// Move to any status by name. Guarded by the same transition table as the named
     /// commands, so this is a shorthand rather than a way around them.
+    #[command(after_help = legal_moves_help())]
     SetStatus {
         #[command(flatten)]
         act: Act,

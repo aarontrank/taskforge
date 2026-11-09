@@ -31,6 +31,23 @@ pub fn can_transition(from: TaskStatus, to: TaskStatus) -> bool {
     }
 }
 
+/// Every status that may move to `to`, in board order.
+pub fn legal_sources(to: TaskStatus) -> Vec<TaskStatus> {
+    TaskStatus::ALL
+        .into_iter()
+        .filter(|&from| can_transition(from, to))
+        .collect()
+}
+
+pub fn reachable_from(to: TaskStatus) -> String {
+    let from = legal_sources(to);
+    if from.is_empty() {
+        return format!("no status moves to {to}");
+    }
+    let names: Vec<&str> = from.iter().map(|s| s.as_str()).collect();
+    format!("{to} is reachable only from {}", names.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::model::TaskStatus::{self, *};
@@ -126,6 +143,21 @@ mod tests {
             "acceptance must be expressible"
         );
         assert!(!can_transition(Running, Merged), "merging skips review");
+    }
+
+    #[test]
+    fn legal_sources_lists_every_status_that_may_move_to_the_target_in_board_order() {
+        assert_eq!(
+            legal_sources(Stuck),
+            vec![
+                Pending,
+                Running,
+                InReview,
+                ChangesRequested,
+                WaitingOnSchedule
+            ]
+        );
+        assert!(legal_sources(Open).is_empty());
     }
 
     #[test]
