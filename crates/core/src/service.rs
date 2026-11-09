@@ -1,5 +1,5 @@
 use crate::hooks::{HookEngine, HookResult};
-use crate::model::{DueStrategy, Recurrence, RecurrenceFrequency, Task, TaskStatus};
+use crate::model::{DueStrategy, Recurrence, RecurrenceFrequency, ReviewOutcome, Task, TaskStatus};
 use crate::store::{AuditEntry, TaskStore};
 use crate::transition::can_transition;
 
@@ -160,6 +160,17 @@ impl<S: TaskStore> TaskService<S> {
             TaskStatus::Done => task.completed_at = Some(self.now.clone()),
             TaskStatus::InReview => task.review_requested_at = Some(self.now.clone()),
             _ => {}
+        }
+        // Only in-review reaches either, so this is a review's verdict. `reviewer` is the
+        // assignee from `set-reviewer`, not whoever ran the command, so it is left alone.
+        let outcome = match to {
+            TaskStatus::Merged => Some(ReviewOutcome::Approved),
+            TaskStatus::ChangesRequested => Some(ReviewOutcome::Rejected),
+            _ => None,
+        };
+        if outcome.is_some() {
+            task.reviewed_at = Some(self.now.clone());
+            task.review_outcome = outcome;
         }
 
         self.last_warnings.clear();
@@ -339,7 +350,9 @@ fn advance(ts: &str, freq: RecurrenceFrequency, interval: u32) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{DueStrategy, Recurrence, RecurrenceFrequency, Task, TaskStatus};
+    use crate::model::{
+        DueStrategy, Recurrence, RecurrenceFrequency, ReviewOutcome, Task, TaskStatus,
+    };
     use crate::service::*;
     use crate::store::MemoryStore;
 
@@ -524,6 +537,50 @@ mod tests {
         assert_eq!(
             out.review_requested_at.as_deref(),
             Some("2026-09-02T00:00:00Z")
+        );
+    }
+
+    fn in_review_with(prior: Option<ReviewOutcome>) -> Task {
+        let mut t = task("TASK-0001");
+        t.status = TaskStatus::InReview;
+        t.review_required = true;
+        t.reviewer = Some("rev".into());
+        t.review_outcome = prior;
+        t
+    }
+
+    #[test]
+    fn merging_records_an_approved_review() {
+        let mut s = svc();
+        // A prior round's rejection, so the test also shows the latest review wins.
+        s.store
+            .put(in_review_with(Some(ReviewOutcome::Rejected)))
+            .unwrap();
+        let out = s
+            .set_status("TASK-0001", TaskStatus::Merged, "agent", None)
+            .unwrap();
+        assert_eq!(out.reviewed_at.as_deref(), Some("2026-09-02T00:00:00Z"));
+        assert_eq!(out.review_outcome, Some(ReviewOutcome::Approved));
+        assert_eq!(
+            out.reviewer.as_deref(),
+            Some("rev"),
+            "reviewer is the assignee"
+        );
+    }
+
+    #[test]
+    fn rejecting_records_a_rejected_review() {
+        let mut s = svc();
+        s.store.put(in_review_with(None)).unwrap();
+        let out = s
+            .set_status("TASK-0001", TaskStatus::ChangesRequested, "agent", None)
+            .unwrap();
+        assert_eq!(out.reviewed_at.as_deref(), Some("2026-09-02T00:00:00Z"));
+        assert_eq!(out.review_outcome, Some(ReviewOutcome::Rejected));
+        assert_eq!(
+            out.reviewer.as_deref(),
+            Some("rev"),
+            "reviewer is the assignee"
         );
     }
 

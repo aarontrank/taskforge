@@ -110,6 +110,58 @@ fn the_full_review_path_runs_start_to_accepted() {
 }
 
 #[test]
+fn reject_and_merge_record_the_review_outcome() {
+    let d = setup();
+    let (_, v) = run(
+        d.path(),
+        &[
+            "task",
+            "create",
+            "--title",
+            "Gated",
+            "--owner",
+            "agent",
+            "--actor",
+            "agent",
+            "--review-required",
+            "--json",
+        ],
+    );
+    let id = v["data"]["id"].as_str().unwrap().to_string();
+
+    let mut last = serde_json::Value::Null;
+    for (step, outcome) in [
+        ("start", None),
+        ("request-review", None),
+        ("reject", Some("rejected")),
+        ("start", Some("rejected")),
+        ("request-review", Some("rejected")),
+        ("merge", Some("approved")),
+    ] {
+        let (ok, r) = run(
+            d.path(),
+            &["task", step, "--id", &id, "--actor", "agent", "--json"],
+        );
+        assert!(ok, "{step} succeeds: {r}");
+        assert_eq!(
+            r["data"]["review_outcome"].as_str(),
+            outcome,
+            "after {step}"
+        );
+        assert_eq!(
+            r["data"]["reviewed_at"].is_string(),
+            outcome.is_some(),
+            "reviewed_at after {step}: {r}"
+        );
+        last = r;
+    }
+    assert!(
+        last["data"]["reviewer"].is_null(),
+        "no reviewer was assigned"
+    );
+}
+
+#[test]
 fn completing_a_review_required_task_directly_is_refused_with_its_code() {
     let d = setup();
     let (_, v) = run(

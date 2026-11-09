@@ -112,8 +112,8 @@ Each takes `--id`, `--actor`, optional `--version <n>` for optimistic concurrenc
 |---|---|---|
 | `task start` | open, pending, changes-requested, waiting-on-schedule, stuck, failed | → running. Refuses while any blocker is not `done` |
 | `task request-review` | running, waiting-on-schedule, stuck | → in-review |
-| `task reject` | in-review | → changes-requested. Feedback landed |
-| `task merge` | in-review | → merged. **Not** terminal |
+| `task reject` | in-review | → changes-requested. Feedback landed. Sets `reviewed_at` and `review_outcome: rejected` |
+| `task merge` | in-review | → merged. **Not** terminal. Sets `reviewed_at` and `review_outcome: approved` |
 | `task accept` | merged, running | → done. The merge is the acceptance, so run this as soon as the review merges; the only success terminal. From `running` only when no review was demanded |
 | `task complete` | running, merged | → done. Fails with `REVIEW_REQUIRED` if review was demanded and the task never went through it |
 | `task pending` | open, stuck | → pending. Planned into a wave, not yet dispatched |
@@ -122,6 +122,10 @@ Each takes `--id`, `--actor`, optional `--version <n>` for optimistic concurrenc
 | `task fail` | running, in-review, changes-requested, merged, waiting-on-schedule, stuck | → failed. `task start` retries it |
 | `task cancel` | **open, pending, stuck, failed only** | → cancelled. In-flight work must be `block`ed first — see below |
 | `task set-status --status <name>` | any legal move | Shorthand for the above; same guard |
+
+`reviewed_at` and `review_outcome` hold the latest review's verdict: a later `reject` or `merge`
+overwrites them, and `request-review` leaves them as they were. Neither command sets `reviewer`.
+That field names the assigned reviewer, which `set-reviewer` sets.
 
 **`cancel` cannot abandon in-flight work directly.** It is refused from `running`, `in-review`,
 `changes-requested`, `waiting-on-schedule`, and `merged` with `INVALID_STATUS_TRANSITION`. To
