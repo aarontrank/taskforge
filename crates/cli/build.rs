@@ -29,9 +29,17 @@ fn main() {
     {
         rerun_if_changed(&git_dir.join("HEAD"));
         // Loose ref for the current branch, and packed-refs for when it has been packed away.
+        // A packed branch has no loose ref until the next commit creates one, so watch the
+        // nearest directory under `refs/` that does exist; cargo scans a directory recursively.
         if let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) {
             if let Some(reference) = head.strip_prefix("ref: ") {
-                rerun_if_changed(&common_dir.join(reference.trim()));
+                let loose = common_dir.join(reference.trim());
+                let refs = common_dir.join("refs");
+                if let Some(watch) = loose.ancestors().find(|a| a.exists()) {
+                    if watch.starts_with(&refs) {
+                        rerun_if_changed(watch);
+                    }
+                }
             }
         }
         rerun_if_changed(&common_dir.join("packed-refs"));
