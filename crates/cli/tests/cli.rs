@@ -159,6 +159,15 @@ fn reject_and_merge_record_the_review_outcome() {
         last["data"]["reviewer"].is_null(),
         "no reviewer was assigned"
     );
+
+    let (ok, out, _) = run_text(d.path(), &["task", "show", "--id", &id]);
+    assert!(ok);
+    assert!(
+        out.lines()
+            .any(|l| l.contains("review outcome") && l.contains("approved")),
+        "text show prints the verdict:\n{out}"
+    );
+    assert!(out.contains("reviewed at"), "text show prints when:\n{out}");
 }
 
 #[test]

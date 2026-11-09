@@ -159,18 +159,15 @@ impl<S: TaskStore> TaskService<S> {
         match to {
             TaskStatus::Done => task.completed_at = Some(self.now.clone()),
             TaskStatus::InReview => task.review_requested_at = Some(self.now.clone()),
+            TaskStatus::Merged => {
+                task.reviewed_at = Some(self.now.clone());
+                task.review_outcome = Some(ReviewOutcome::Approved);
+            }
+            TaskStatus::ChangesRequested => {
+                task.reviewed_at = Some(self.now.clone());
+                task.review_outcome = Some(ReviewOutcome::Rejected);
+            }
             _ => {}
-        }
-        // Only in-review reaches either, so this is a review's verdict. `reviewer` is the
-        // assignee from `set-reviewer`, not whoever ran the command, so it is left alone.
-        let outcome = match to {
-            TaskStatus::Merged => Some(ReviewOutcome::Approved),
-            TaskStatus::ChangesRequested => Some(ReviewOutcome::Rejected),
-            _ => None,
-        };
-        if outcome.is_some() {
-            task.reviewed_at = Some(self.now.clone());
-            task.review_outcome = outcome;
         }
 
         self.last_warnings.clear();
@@ -552,7 +549,7 @@ mod tests {
     #[test]
     fn merging_records_an_approved_review() {
         let mut s = svc();
-        // A prior round's rejection, so the test also shows the latest review wins.
+        // Prior round's verdict, which this merge must overwrite.
         s.store
             .put(in_review_with(Some(ReviewOutcome::Rejected)))
             .unwrap();
