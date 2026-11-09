@@ -39,13 +39,24 @@ pub fn legal_sources(to: TaskStatus) -> Vec<TaskStatus> {
         .collect()
 }
 
-pub fn reachable_from(to: TaskStatus) -> String {
-    let from = legal_sources(to);
-    if from.is_empty() {
+pub fn reachable_from(from: TaskStatus, to: TaskStatus) -> String {
+    if from == to {
+        return format!("it is already {to}");
+    }
+    let sources = legal_sources(to);
+    if sources.is_empty() {
         return format!("no status moves to {to}");
     }
-    let names: Vec<&str> = from.iter().map(|s| s.as_str()).collect();
+    let names: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
     format!("{to} is reachable only from {}", names.join(", "))
+}
+
+/// Every status `from` may move to, in board order.
+pub fn legal_targets(from: TaskStatus) -> Vec<TaskStatus> {
+    TaskStatus::ALL
+        .into_iter()
+        .filter(|&to| can_transition(from, to))
+        .collect()
 }
 
 #[cfg(test)]

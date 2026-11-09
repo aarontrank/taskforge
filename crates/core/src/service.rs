@@ -8,7 +8,7 @@ use crate::transition::can_transition;
 pub enum TaskError {
     #[error("task not found: {0}")]
     NotFound(String),
-    #[error("cannot move {id} from {from} to {to}; {}", crate::transition::reachable_from(*to))]
+    #[error("cannot move {id} from {from} to {to}; {}", crate::transition::reachable_from(*from, *to))]
     InvalidTransition {
         id: String,
         from: TaskStatus,
@@ -426,6 +426,19 @@ mod tests {
             err.to_string(),
             "cannot move TASK-0001 from open to stuck; stuck is reachable only from \
              pending, running, in-review, changes-requested, waiting-on-schedule"
+        );
+    }
+
+    #[test]
+    fn a_move_to_the_current_status_says_the_task_is_already_there() {
+        let mut s = svc();
+        s.store.put(task("TASK-0001")).unwrap(); // Open
+        let err = s
+            .set_status("TASK-0001", TaskStatus::Open, "agent", None)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot move TASK-0001 from open to open; it is already open"
         );
     }
 

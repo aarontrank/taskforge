@@ -2575,6 +2575,12 @@ fn transition_help_names_the_statuses_each_command_is_legal_from() {
     use taskforge_core::model::TaskStatus;
     use taskforge_core::transition::can_transition;
     for (cmd, to) in [
+        ("start", TaskStatus::Running),
+        ("request-review", TaskStatus::InReview),
+        ("merge", TaskStatus::Merged),
+        ("accept", TaskStatus::Done),
+        ("complete", TaskStatus::Done),
+        ("reject", TaskStatus::ChangesRequested),
         ("pending", TaskStatus::Pending),
         ("wait", TaskStatus::WaitingOnSchedule),
         ("block", TaskStatus::Stuck),
@@ -2601,19 +2607,30 @@ fn transition_help_names_the_statuses_each_command_is_legal_from() {
 
 #[test]
 fn set_status_help_lists_every_legal_move() {
+    use taskforge_core::model::TaskStatus;
+    use taskforge_core::transition::can_transition;
     let out = Command::new(env!("CARGO_BIN_EXE_taskforge"))
         .args(["task", "set-status", "--help"])
         .output()
         .unwrap();
     let help = String::from_utf8(out.stdout).unwrap();
-    for line in [
-        "open -> pending, running, cancelled",
-        "running -> in-review, waiting-on-schedule, stuck, done, failed",
-        "done -> (none)",
-    ] {
+    for from in TaskStatus::ALL {
+        let to: Vec<&str> = TaskStatus::ALL
+            .into_iter()
+            .filter(|&to| can_transition(from, to))
+            .map(|to| to.as_str())
+            .collect();
+        let to = if to.is_empty() {
+            "(none)".to_string()
+        } else {
+            to.join(", ")
+        };
+        let line = format!("  {from} -> {to}\n");
         assert!(
-            help.contains(line),
+            help.contains(&line),
             "set-status --help lacks {line:?}:\n{help}"
         );
     }
+    assert!(help.contains("  open -> pending, running, cancelled\n"));
+    assert!(help.contains("  done -> (none)\n"));
 }
