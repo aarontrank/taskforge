@@ -49,7 +49,8 @@ open ─→ pending ─→ running ─→ in-review ─→ merged ─→ done
   `task accept` as soon as the review merges — whoever merged it — and never leave a task here
   waiting for someone to confirm. Nothing warns about an agent doing this; it is the normal path.
   A task whose status is already `merged` is the record that its review merged: accepting it
-  needs no further check and no one's permission.
+  needs no further check and no one's permission. When you learn a review merged in the review
+  tool and the task is still `in-review`, `task merge` is how you record it, then `task accept`.
 - **`done` is the only success terminal**, reached two ways: `task accept` after a merge, or
   `task complete` for work that needed no review. Not every `done` task passed through `merged`.
 
@@ -68,6 +69,7 @@ Consequences you will hit:
 - **`block`, `reject` and `cancel` take no reason.** Run `task add-comment` with the why
   *before* the transition; otherwise the task records that it moved and never why. `stuck` is
   how you ask for a human: block a task only after commenting what decision or chase it needs.
+  The one exception is the `block` on the way to `cancel` below, which is a step, not a request.
 - **In-flight work cannot be cancelled directly.** `cancel` is legal only from `open`,
   `pending`, `stuck`, and `failed`. To abandon a `running` or `in-review` task, `block` it first
   (→ `stuck`), then `cancel`. Deliberate: it makes dropping live work a two-step decision. Once a
@@ -87,7 +89,8 @@ crossing package boundaries needs one each) and `expected_by`
 (which dev workspace they hold it in) via `task set-worker`. Note `checkout` is the *development*
 workspace — distinct from the global `--workspace` flag, which selects a taskforge partition.
 
-Three fields say what the work *is*, for reporting: `kind` (a **closed** set — `feature`, `bug`,
+Three fields say what the work *is*, for reporting (`task list` has no filter on any of them:
+list with `--json` and select on the field yourself): `kind` (a **closed** set — `feature`, `bug`,
 `chore`, `investigation`, `oncall`, `doc`; anything else is `INVALID_KIND`), `tags` (open-ended
 projects and themes), and `ticket` (the external tracker item, an opaque string). Set them at
 creation with `--kind`/`--ticket`/`--tag` or later with `set-kind`/`set-ticket`/`add-tag`. A task
@@ -111,6 +114,8 @@ taskforge doctor --json                   # state: fresh | stale | unknown
 ```
 
 `stale` means the installed binary predates the source and `note` carries the reinstall command.
+A stale binary still runs every command it has, so carry on with those. Reinstalling is the
+person's call: tell them, with the `note`, rather than running it yourself.
 These two flags shipped and then sat unreachable for a week for exactly that reason, while
 `--version` reported the same number for both builds. One command settles it.
 

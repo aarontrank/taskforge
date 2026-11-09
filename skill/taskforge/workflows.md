@@ -97,8 +97,10 @@ reportable as such, whereas a wrong kind is a wrong number in a report nobody wi
 When more than one agent may touch a task, pass the version you read. This works on **every**
 mutating command — the status transitions and the field setters alike:
 
-**Re-read the version before every mutation.** Each one bumps it, so reusing a captured value for
-a second command is guaranteed to fail with `CONFLICT_VERSION_MISMATCH`.
+**Pass the current version to every mutation.** Each one bumps it, so reusing a value captured
+before your own last mutation is guaranteed to fail with `CONFLICT_VERSION_MISMATCH`. The current
+version is the one in your latest `task show`, or in the `data` of your own last mutation's
+response. `add-worklog` and `add-comment` do not bump it.
 
 ```bash
 read_version() {
