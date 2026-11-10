@@ -23,6 +23,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Provenance baked in by `build.rs`. See that file for why the commit is not optional decoration.
 const GIT_COMMIT: &str = env!("TASKFORGE_GIT_COMMIT");
 const SOURCE_DIR: &str = env!("TASKFORGE_SOURCE_DIR");
+const SOURCE_REPO: &str = env!("TASKFORGE_SOURCE_REPO");
 const BUILD_EPOCH: &str = env!("TASKFORGE_BUILD_EPOCH");
 
 /// What `--version` prints: `0.3.0 (60610a0)`.
@@ -426,7 +427,8 @@ enum Top {
 #[derive(Debug, PartialEq, Eq)]
 enum Freshness {
     Fresh,
-    /// `behind` is `None` when the distance cannot be counted — see the tests.
+    /// `behind` is `None` when the distance cannot be counted, or the build has commits the source
+    /// lacks — see the tests.
     Stale {
         behind: Option<u32>,
     },
@@ -440,15 +442,40 @@ enum Freshness {
 /// Pure, and separated from the `git` calls that feed it, because the interesting case — a stale
 /// binary — cannot be produced by a test that runs the binary it just built. The IO shell is
 /// `doctor` below; everything worth asserting is here.
-fn freshness(baked: &str, source_head: Option<&str>, behind: Option<u32>) -> Freshness {
+///
+/// `counts` is (commits only the build has, commits only the source has), from
+/// `rev-list --left-right --count`.
+fn freshness(baked: &str, source_head: Option<&str>, counts: Option<(u32, u32)>) -> Freshness {
     if baked == "unknown" {
         return Freshness::Unknown("this binary was built outside a git checkout");
     }
     match source_head {
         None => Freshness::Unknown("the source checkout is missing or not a git repository"),
         Some(head) if head == baked => Freshness::Fresh,
-        Some(_) => Freshness::Stale { behind },
+        Some(_) => match counts {
+            Some((0, 0)) => Freshness::Fresh,
+            Some((0, n)) => Freshness::Stale { behind: Some(n) },
+            _ => Freshness::Stale { behind: None },
+        },
     }
+}
+
+/// Parse `rev-list --left-right --count`'s `<left>\t<right>`.
+fn parse_counts(s: &str) -> Option<(u32, u32)> {
+    let (l, r) = s.split_once('\t')?;
+    Some((l.parse().ok()?, r.parse().ok()?))
+}
+
+/// The checkout `doctor` compares against, with its HEAD: the one the binary was built in, else
+/// the repository's main working tree once git cannot read that one.
+fn locate_source(
+    candidates: [&str; 2],
+    head: impl Fn(&str) -> Option<String>,
+) -> Option<(&str, String)> {
+    candidates
+        .into_iter()
+        .filter(|d| *d != "unknown")
+        .find_map(|d| head(d).map(|h| (d, h)))
 }
 
 /// Exit status for a verdict. Only staleness fails, so `doctor` can gate a script; `Unknown` is
@@ -899,15 +926,25 @@ fn main() {
 /// a `git` subprocess per invocation is a real cost to pay for a check that changes daily at most.
 fn doctor() -> ! {
     let label = "doctor";
-    let source_head = git_in(SOURCE_DIR, &["rev-parse", "--short=7", "HEAD"]);
-    // Counting fails when the baked commit is not an ancestor of HEAD — after a rebase, or a
-    // checkout of an unrelated branch. That is still stale, just of unknown distance.
-    let behind = git_in(
-        SOURCE_DIR,
-        &["rev-list", "--count", &format!("{GIT_COMMIT}..HEAD")],
-    )
-    .and_then(|s| s.parse::<u32>().ok());
-    let verdict = freshness(GIT_COMMIT, source_head.as_deref(), behind);
+    let located = locate_source([SOURCE_DIR, SOURCE_REPO], |d| {
+        git_in(d, &["rev-parse", "--short=7", "HEAD"])
+    });
+    let source_dir = located.as_ref().map_or(SOURCE_DIR, |(d, _)| *d);
+    let source_head = located.as_ref().map(|(_, h)| h.clone());
+    let counts = located
+        .and_then(|(d, _)| {
+            git_in(
+                d,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{GIT_COMMIT}...HEAD"),
+                ],
+            )
+        })
+        .and_then(|s| parse_counts(&s));
+    let verdict = freshness(GIT_COMMIT, source_head.as_deref(), counts);
 
     let (state, note) = match &verdict {
         Freshness::Fresh => (
@@ -918,13 +955,15 @@ fn doctor() -> ! {
             "stale",
             match behind {
                 Some(n) => format!(
-                    "the source is {n} commit{} ahead — reinstall with \
+                    "the source is {n} commit{} ahead — reinstall from {source_dir} with \
                      `cargo install --locked --path crates/cli`",
                     if *n == 1 { "" } else { "s" }
                 ),
-                None => "the source has moved and this build is not on it — reinstall with \
-                         `cargo install --locked --path crates/cli`"
-                    .to_string(),
+                None => format!(
+                    "this build is not on the source's history: an unmerged or squash-merged \
+                     branch, or a rebase — reinstall from {source_dir} once its commits are \
+                     there, with `cargo install --locked --path crates/cli`"
+                ),
             },
         ),
         Freshness::Unknown(why) => ("unknown", (*why).to_string()),
@@ -939,11 +978,16 @@ fn doctor() -> ! {
             "built_at": build_time(),
         },
         "source": {
-            "dir": SOURCE_DIR,
+            "dir": source_dir,
+            "built_in": SOURCE_DIR,
             "commit": source_head,
-            "version": source_version(),
+            "version": source_version(source_dir),
         },
-        "behind": behind,
+        "behind": match &verdict {
+            Freshness::Fresh => Some(0),
+            Freshness::Stale { behind } => *behind,
+            Freshness::Unknown(_) => None,
+        },
     });
 
     // Not the usual `Envelope::ok`/`err` split: staleness is a true report, not a failed command,
@@ -958,9 +1002,14 @@ fn doctor() -> ! {
         );
         println!(
             "  source   {}  ({})",
-            source_version().unwrap_or_else(|| "?".into()),
+            source_version(source_dir).unwrap_or_else(|| "?".into()),
             source_head.as_deref().unwrap_or("?")
         );
+        if source_dir != SOURCE_DIR && SOURCE_DIR != "unknown" {
+            println!(
+                "  built in {SOURCE_DIR}, which git can no longer read; compared against {source_dir}"
+            );
+        }
         println!("  {}: {note}", state.to_uppercase());
     }
     std::process::exit(exit_code(&verdict))
@@ -1001,9 +1050,8 @@ fn build_time() -> String {
 ///
 /// A line scan rather than a TOML parse: one field this project owns is not worth a dependency,
 /// and a wrong answer here is cosmetic — the commit comparison is what decides the verdict.
-fn source_version() -> Option<String> {
-    let manifest =
-        std::fs::read_to_string(std::path::Path::new(SOURCE_DIR).join("Cargo.toml")).ok()?;
+fn source_version(dir: &str) -> Option<String> {
+    let manifest = std::fs::read_to_string(std::path::Path::new(dir).join("Cargo.toml")).ok()?;
     let mut in_package = false;
     for line in manifest.lines() {
         let line = line.trim();
@@ -1649,7 +1697,16 @@ mod tests {
     #[test]
     fn a_binary_built_from_the_current_head_is_fresh() {
         assert_eq!(
-            freshness("60610a0", Some("60610a0"), None),
+            freshness("60610a0", Some("60610a0"), Some((0, 0))),
+            Freshness::Fresh
+        );
+    }
+
+    #[test]
+    fn the_same_commit_abbreviated_differently_is_fresh() {
+        // Git lengthens `--short` once a prefix becomes ambiguous.
+        assert_eq!(
+            freshness("abc1234", Some("abc12345"), Some((0, 0))),
             Freshness::Fresh
         );
     }
@@ -1657,20 +1714,39 @@ mod tests {
     #[test]
     fn a_binary_built_from_an_older_commit_is_stale() {
         assert_eq!(
-            freshness("42471d8", Some("60610a0"), Some(3)),
+            freshness("42471d8", Some("60610a0"), Some((0, 3))),
             Freshness::Stale { behind: Some(3) }
         );
     }
 
     #[test]
     fn staleness_is_reported_even_when_the_distance_cannot_be_counted() {
-        // A rebase or a force-push leaves the baked commit unreachable from HEAD, so
-        // `rev-list --count` fails. Not knowing *how far* behind is no reason to stop
-        // reporting *that* it is behind — that silence is the whole bug this detects.
+        // The baked commit no longer exists in the repository, so `rev-list` fails. Not knowing
+        // *how far* behind is no reason to stop reporting *that* it is behind.
         assert_eq!(
             freshness("deadbee", Some("60610a0"), None),
             Freshness::Stale { behind: None }
         );
+    }
+
+    #[test]
+    fn a_build_with_commits_the_source_lacks_is_stale_with_no_distance() {
+        // An unmerged or squash-merged branch, or a rebase.
+        for counts in [(1, 0), (2, 5)] {
+            assert_eq!(
+                freshness("5d6a798", Some("f74e7a6"), Some(counts)),
+                Freshness::Stale { behind: None },
+                "{counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn left_right_counts_parse_and_garbage_does_not() {
+        assert_eq!(parse_counts("2\t5"), Some((2, 5)));
+        assert_eq!(parse_counts("0\t0"), Some((0, 0)));
+        assert_eq!(parse_counts("2"), None);
+        assert_eq!(parse_counts("x\t5"), None);
     }
 
     #[test]
@@ -1690,6 +1766,40 @@ mod tests {
             freshness("60610a0", None, None),
             Freshness::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn doctor_compares_against_the_checkout_it_was_built_in_while_it_exists() {
+        let head = |d: &str| (d == "/wt" || d == "/main").then(|| format!("head of {d}"));
+        assert_eq!(
+            locate_source(["/wt", "/main"], head),
+            Some(("/wt", "head of /wt".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_removed_worktree_falls_back_to_the_main_working_tree() {
+        let head = |d: &str| (d == "/main").then(|| "abc1234".to_string());
+        assert_eq!(
+            locate_source(["/wt", "/main"], head),
+            Some(("/main", "abc1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn with_neither_checkout_readable_there_is_no_source() {
+        assert_eq!(locate_source(["/wt", "/main"], |_| None), None);
+    }
+
+    #[test]
+    fn an_unrecorded_path_is_never_looked_up() {
+        // `unknown` is what `build.rs` bakes when it found no path. Handed to git as a directory
+        // it would resolve against the caller's working directory.
+        let head = |d: &str| {
+            assert_ne!(d, "unknown", "looked up the placeholder as a path");
+            None
+        };
+        assert_eq!(locate_source(["unknown", "unknown"], head), None);
     }
 
     #[test]

@@ -77,10 +77,15 @@ taskforge doctor --json                   # compares that commit against its sou
 | `state` | Meaning | Exit |
 |---|---|---|
 | `fresh` | The binary was built from the checkout's current HEAD | 0 |
-| `stale` | The source has moved since this binary was built. `note` carries the reinstall command and `behind` the commit count when it can be counted | 1 |
+| `stale` | The source has moved since this binary was built. `note` carries the reinstall command and `behind` the commit count. `behind` is `null` when the build is not on the source's history (an unmerged or squash-merged branch, a rebase, or a commit git no longer has): reinstalling before its commits land there would drop them | 1 |
 | `unknown` | Built outside a git checkout, or the source is gone. Nothing can be concluded, which is not the same as "fine" | 0 |
 
 Only `stale` exits non-zero, so `doctor` can gate a script.
+
+`source.dir` is the checkout `doctor` compared against, and `source.built_in` the one the binary was
+built in. They differ only when git can no longer read the checkout the binary was built in,
+typically a linked worktree removed after its branch merged. `doctor` then compares against the
+repository's main working tree, whatever branch that has checked out, by the same rules.
 
 **Run this before trusting that a flag is missing.** A command erroring with *unexpected argument*
 is far more often a stale install than a flag that does not exist: `--stale`, `--overdue` and
