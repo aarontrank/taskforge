@@ -949,28 +949,7 @@ fn doctor() -> ! {
         .and_then(|s| parse_counts(&s));
     let verdict = freshness(GIT_COMMIT, source_head.as_deref(), counts);
 
-    let (state, note) = match &verdict {
-        Freshness::Fresh => (
-            "fresh",
-            "this binary is built from the current source".to_string(),
-        ),
-        Freshness::Stale { behind } => (
-            "stale",
-            match behind {
-                Some(n) => format!(
-                    "the source is {n} commit{} ahead — reinstall from {source_dir} with \
-                     `cargo install --locked --path crates/cli`",
-                    if *n == 1 { "" } else { "s" }
-                ),
-                None => format!(
-                    "the source has moved and git could not count the distance from this build's \
-                     commit — reinstall from {source_dir} with `cargo install --locked --path \
-                     crates/cli`"
-                ),
-            },
-        ),
-        Freshness::Unknown(why) => ("unknown", (*why).to_string()),
-    };
+    let (state, note, behind) = report(&verdict, source_dir);
 
     let data = serde_json::json!({
         "state": state,
@@ -986,11 +965,7 @@ fn doctor() -> ! {
             "commit": source_head,
             "version": source_version(source_dir),
         },
-        "behind": match &verdict {
-            Freshness::Fresh => Some(0),
-            Freshness::Stale { behind } => *behind,
-            Freshness::Unknown(_) => None,
-        },
+        "behind": behind,
     });
 
     // Not the usual `Envelope::ok`/`err` split: staleness is a true report, not a failed command,
@@ -1016,6 +991,33 @@ fn doctor() -> ! {
         println!("  {}: {note}", state.to_uppercase());
     }
     std::process::exit(exit_code(&verdict))
+}
+
+fn report(verdict: &Freshness, reinstall: &str) -> (&'static str, String, Option<u32>) {
+    match verdict {
+        Freshness::Fresh => (
+            "fresh",
+            "this binary is built from the current source".to_string(),
+            Some(0),
+        ),
+        Freshness::Stale { behind } => (
+            "stale",
+            match behind {
+                Some(n) => format!(
+                    "the source is {n} commit{} ahead — reinstall from {reinstall} with \
+                     `cargo install --locked --path crates/cli`",
+                    if *n == 1 { "" } else { "s" }
+                ),
+                None => format!(
+                    "the source has moved and git could not count the distance from this build's \
+                     commit — reinstall from {reinstall} with `cargo install --locked --path \
+                     crates/cli`"
+                ),
+            },
+            *behind,
+        ),
+        Freshness::Unknown(why) => ("unknown", (*why).to_string(), None),
+    }
 }
 
 /// Run git inside a directory, or `None` if git is absent, the directory is gone, or it failed.
@@ -1805,6 +1807,48 @@ mod tests {
             None
         };
         assert_eq!(locate_source(["unknown", "unknown"], head), None);
+    }
+
+    #[test]
+    fn a_fresh_report_is_zero_behind() {
+        let (state, note, behind) = report(&Freshness::Fresh, "/src");
+        assert_eq!(state, "fresh");
+        assert_eq!(note, "this binary is built from the current source");
+        assert_eq!(behind, Some(0));
+    }
+
+    #[test]
+    fn a_stale_report_counts_the_distance_and_names_the_reinstall() {
+        let (state, note, behind) = report(&Freshness::Stale { behind: Some(3) }, "/src");
+        assert_eq!(state, "stale");
+        assert_eq!(
+            note,
+            "the source is 3 commits ahead — reinstall from /src with \
+             `cargo install --locked --path crates/cli`"
+        );
+        assert_eq!(behind, Some(3));
+        let (_, note, _) = report(&Freshness::Stale { behind: Some(1) }, "/src");
+        assert!(note.starts_with("the source is 1 commit ahead "), "{note}");
+    }
+
+    #[test]
+    fn an_uncounted_stale_report_is_null_behind_and_still_names_the_reinstall() {
+        let (state, note, behind) = report(&Freshness::Stale { behind: None }, "/src");
+        assert_eq!(state, "stale");
+        assert_eq!(
+            note,
+            "the source has moved and git could not count the distance from this build's \
+             commit — reinstall from /src with `cargo install --locked --path crates/cli`"
+        );
+        assert_eq!(behind, None);
+    }
+
+    #[test]
+    fn an_unknown_report_is_null_behind_and_its_reason() {
+        let (state, note, behind) = report(&Freshness::Unknown("why"), "/src");
+        assert_eq!(state, "unknown");
+        assert_eq!(note, "why");
+        assert_eq!(behind, None);
     }
 
     #[test]
