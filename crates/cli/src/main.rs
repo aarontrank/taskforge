@@ -427,8 +427,7 @@ enum Top {
 #[derive(Debug, PartialEq, Eq)]
 enum Freshness {
     Fresh,
-    /// `behind` is `None` when the distance cannot be counted, or the build has commits the source
-    /// lacks — see the tests.
+    /// `behind` is `None` when the distance cannot be counted.
     Stale {
         behind: Option<u32>,
     },
@@ -455,7 +454,11 @@ fn freshness(baked: &str, source_head: Option<&str>, counts: Option<(u32, u32)>)
         Some(_) => match counts {
             Some((0, 0)) => Freshness::Fresh,
             Some((0, n)) => Freshness::Stale { behind: Some(n) },
-            _ => Freshness::Stale { behind: None },
+            Some(_) => Freshness::Unknown(
+                "this build has commits the source's history lacks: an unmerged or squash-merged \
+                 branch, a rebase, or a source checkout that is behind",
+            ),
+            None => Freshness::Stale { behind: None },
         },
     }
 }
@@ -960,9 +963,8 @@ fn doctor() -> ! {
                     if *n == 1 { "" } else { "s" }
                 ),
                 None => format!(
-                    "this build is not on the source's history: an unmerged or squash-merged \
-                     branch, or a rebase — reinstall from {source_dir} once its commits are \
-                     there, with `cargo install --locked --path crates/cli`"
+                    "the source has moved and git no longer has this build's commit — reinstall \
+                     from {source_dir} with `cargo install --locked --path crates/cli`"
                 ),
             },
         ),
@@ -1730,12 +1732,15 @@ mod tests {
     }
 
     #[test]
-    fn a_build_with_commits_the_source_lacks_is_stale_with_no_distance() {
-        // An unmerged or squash-merged branch, or a rebase.
+    fn a_build_with_commits_the_source_lacks_is_unknown() {
+        // Unmerged, squash-merged, rebased, or ahead of an unpulled checkout: history cannot tell
+        // these apart, and calling them stale would exit 1 on a build that may be newest.
         for counts in [(1, 0), (2, 5)] {
-            assert_eq!(
-                freshness("5d6a798", Some("f74e7a6"), Some(counts)),
-                Freshness::Stale { behind: None },
+            assert!(
+                matches!(
+                    freshness("5d6a798", Some("f74e7a6"), Some(counts)),
+                    Freshness::Unknown(_)
+                ),
                 "{counts:?}"
             );
         }
