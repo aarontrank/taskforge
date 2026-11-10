@@ -77,7 +77,7 @@ taskforge doctor --json                   # compares that commit against its sou
 | `state` | Meaning | Exit |
 |---|---|---|
 | `fresh` | The binary was built from the checkout's current HEAD | 0 |
-| `stale` | The source has moved since this binary was built. `note` carries the reinstall command and `behind` the commit count. `behind` is `null` when git no longer has the build's commit | 1 |
+| `stale` | The source has moved since this binary was built. `note` carries the reinstall command and `behind` the commit count. `behind` is `null` when git could not count the distance, usually because it no longer has the build's commit | 1 |
 | `unknown` | Built outside a git checkout, the source is gone, or the build has commits the source's history lacks (an unmerged or squash-merged branch, a rebase, or a source checkout that is behind). Nothing can be concluded, which is not the same as "fine": after a squash merge a stale binary reads `unknown` | 0 |
 
 Only `stale` exits non-zero, so `doctor` can gate a script.

@@ -963,8 +963,9 @@ fn doctor() -> ! {
                     if *n == 1 { "" } else { "s" }
                 ),
                 None => format!(
-                    "the source has moved and git no longer has this build's commit — reinstall \
-                     from {source_dir} with `cargo install --locked --path crates/cli`"
+                    "the source has moved and git could not count the distance from this build's \
+                     commit — reinstall from {source_dir} with `cargo install --locked --path \
+                     crates/cli`"
                 ),
             },
         ),
