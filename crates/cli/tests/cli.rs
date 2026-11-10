@@ -2394,6 +2394,11 @@ fn doctor_reports_where_the_source_is_and_when_the_binary_was_built() {
             v["data"]["source"]["version"], v["data"]["binary"]["version"],
             "a fresh build's two versions agree: {v}"
         );
+        // `dir` is what was compared. While the build's own checkout exists, that is it.
+        assert_eq!(
+            v["data"]["source"]["built_in"], v["data"]["source"]["dir"],
+            "{v}"
+        );
     } else {
         // Reporting a path it never had would send someone to reinstall from nowhere.
         assert_eq!(v["data"]["source"]["dir"], "unknown", "{v}");

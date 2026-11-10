@@ -63,7 +63,7 @@ later: `cargo uninstall taskforge-cli`.
 
 ```bash
 taskforge --version      # 0.3.0 (60610a0) — semver plus the commit it was built from
-taskforge doctor         # compares that commit against this checkout; exit 1 if stale
+taskforge doctor         # compares that commit against its checkout; exit 1 if stale
 ```
 
 Worth the two commands, because forgetting the reinstall is not a hypothetical: the installed
