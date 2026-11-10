@@ -1074,10 +1074,14 @@ fn doctor() -> ! {
 fn report(verdict: &Freshness, reinstall: Option<&str>) -> (&'static str, String, Option<u32>) {
     let how = match reinstall {
         Some(d) => format!("reinstall from {d} with `cargo install --locked --path crates/cli`"),
-        None => format!(
-            "check out {SOURCE_REF} in a checkout of {GIT_COMMON_DIR} and reinstall from there \
-             with `cargo install --locked --path crates/cli`"
-        ),
+        None => {
+            let branch = SOURCE_REF.trim_start_matches("refs/heads/");
+            format!(
+                "no checkout has {branch} checked out: run `git checkout {branch}` in a checkout \
+                 of {GIT_COMMON_DIR}, then reinstall from there with `cargo install --locked \
+                 --path crates/cli`"
+            )
+        }
     };
     match verdict {
         Freshness::Fresh => (
@@ -2099,7 +2103,7 @@ mod tests {
         for behind in [Some(2), None] {
             let (_, note, _) = report(&Freshness::Stale { behind }, None);
             assert!(!note.contains("reinstall from /"), "{note}");
-            assert!(note.contains("check out refs/heads/main"), "{note}");
+            assert!(note.contains("`git checkout main`"), "{note}");
         }
     }
 
