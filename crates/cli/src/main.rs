@@ -499,8 +499,14 @@ fn locate(
         git(cwd, &args).and_then(|o| parse_counts(&o))
     };
     if built_in != "unknown" {
-        let head = git(built_in, &["rev-parse", "--show-toplevel", "HEAD"])
-            .and_then(|o| head_at_toplevel(&o, built_in));
+        let args = [
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+            "HEAD",
+        ];
+        let head = git(built_in, &args).and_then(|o| checkout_head(&o, built_in, common));
         if let Some(head) = head {
             return Some(Source {
                 counts: count(built_in, &[], "HEAD", &head),
@@ -516,7 +522,7 @@ fn locate(
     let flags = ["--git-dir=."];
     let in_common = |args: &[&str]| git(common, &[&flags[..], args].concat());
     let head = in_common(&["rev-parse", "--verify", "--quiet", SOURCE_REF])?;
-    let reinstall = in_common(&["worktree", "list", "--porcelain"])
+    let reinstall = in_common(&["worktree", "list", "--porcelain", "-z"])
         .and_then(|o| checkout_of(&o, SOURCE_REF).map(str::to_string));
     Some(Source {
         counts: count(common, &flags, SOURCE_REF, &head),
@@ -526,19 +532,20 @@ fn locate(
     })
 }
 
-/// HEAD from `rev-parse --show-toplevel HEAD`, if the toplevel is `dir` itself.
-fn head_at_toplevel(out: &str, dir: &str) -> Option<String> {
+/// HEAD from `rev-parse --show-toplevel --git-common-dir HEAD`, if the toplevel is `dir` itself and
+/// the repository is `common`.
+fn checkout_head(out: &str, dir: &str, common: &str) -> Option<String> {
     let mut lines = out.lines();
-    (lines.next()? == dir).then_some(())?;
+    (lines.next()? == dir && lines.next()? == common).then_some(())?;
     lines.next().map(str::to_string)
 }
 
-/// The worktree in `worktree list --porcelain` that has `reference` checked out.
+/// The worktree in `worktree list --porcelain -z` that has `reference` checked out.
 fn checkout_of<'a>(porcelain: &'a str, reference: &str) -> Option<&'a str> {
-    porcelain.split("\n\n").find_map(|entry| {
+    porcelain.split("\0\0").find_map(|entry| {
         let mut path = None;
         let mut on_ref = false;
-        for line in entry.lines() {
+        for line in entry.split('\0') {
             if let Some(p) = line.strip_prefix("worktree ") {
                 path = Some(p);
             } else if line.strip_prefix("branch ") == Some(reference) {
@@ -1866,11 +1873,14 @@ mod tests {
     fn doctor_compares_against_the_checkout_it_was_built_in_while_it_exists() {
         let calls = Default::default();
         let responses = [
-            ("/wt", "rev-parse --show-toplevel HEAD", "/wt\nbbbb"),
+            (
+                "/wt",
+                "rev-parse --path-format=absolute --show-toplevel --git-common-dir HEAD",
+                "/wt\n/r/.git\nbbbb",
+            ),
             ("/wt", "rev-list --left-right --count aaaa...HEAD", "0\t2"),
         ];
-        let common = existing_dir();
-        let s = locate("/wt", &common, "aaaa", fake_git(&responses, &calls)).unwrap();
+        let s = locate("/wt", "/r/.git", "aaaa", fake_git(&responses, &calls)).unwrap();
         assert_eq!(
             s,
             Source {
@@ -1886,8 +1896,12 @@ mod tests {
     #[test]
     fn a_fresh_build_spawns_git_once() {
         let calls = Default::default();
-        let responses = [("/wt", "rev-parse --show-toplevel HEAD", "/wt\naaaa")];
-        let s = locate("/wt", "unknown", "aaaa", fake_git(&responses, &calls)).unwrap();
+        let responses = [(
+            "/wt",
+            "rev-parse --path-format=absolute --show-toplevel --git-common-dir HEAD",
+            "/wt\n/r/.git\naaaa",
+        )];
+        let s = locate("/wt", "/r/.git", "aaaa", fake_git(&responses, &calls)).unwrap();
         assert_eq!(s.counts, Some((0, 0)));
         assert_eq!(calls.borrow().len(), 1, "{calls:?}");
     }
@@ -1896,8 +1910,8 @@ mod tests {
     fn a_removed_worktree_compares_against_the_recorded_ref_not_a_checkout() {
         let common = existing_dir();
         let calls = Default::default();
-        let porcelain = "worktree /main\nHEAD 9999\nbranch refs/heads/feature\n\n\
-                         worktree /other\nHEAD cccc\nbranch refs/heads/main\n";
+        let porcelain = "worktree /main\0HEAD 9999\0branch refs/heads/feature\0\0\
+                         worktree /other\0HEAD cccc\0branch refs/heads/main\0\0";
         let responses = [
             (
                 common.as_str(),
@@ -1906,7 +1920,7 @@ mod tests {
             ),
             (
                 common.as_str(),
-                "--git-dir=. worktree list --porcelain",
+                "--git-dir=. worktree list --porcelain -z",
                 porcelain,
             ),
             (
@@ -1935,7 +1949,16 @@ mod tests {
         std::fs::create_dir(&repo).unwrap();
         let repo = repo.to_str().unwrap();
         let g = |args: &[&str]| {
-            let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+            let id = [
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ];
             git_in(repo, &[&id[..], args].concat())
         };
         if g(&["--version"]).is_none() {
@@ -1952,6 +1975,9 @@ mod tests {
         let common = common.to_str().unwrap();
         let gone = top.join("wt");
         let gone = gone.to_str().unwrap();
+
+        let s = locate(repo, common, &baked, git_in).unwrap();
+        assert_eq!(s.reference, None, "the repo itself is a readable checkout");
 
         let s = locate(gone, common, &baked, git_in).unwrap();
         assert_eq!(
@@ -1973,7 +1999,11 @@ mod tests {
     #[test]
     fn a_path_inside_another_checkout_is_not_the_build_checkout() {
         let calls = Default::default();
-        let responses = [("/b/old-wt", "rev-parse --show-toplevel HEAD", "/b\nbbbb")];
+        let responses = [(
+            "/b/old-wt",
+            "rev-parse --path-format=absolute --show-toplevel --git-common-dir HEAD",
+            "/b\n/b/.git\nbbbb",
+        )];
         assert_eq!(
             locate("/b/old-wt", "unknown", "aaaa", fake_git(&responses, &calls)),
             None
@@ -2055,20 +2085,24 @@ mod tests {
 
     #[test]
     fn a_checkout_counts_only_as_its_own_toplevel() {
-        assert_eq!(head_at_toplevel("/a\nabc\n", "/a"), Some("abc".to_string()));
+        let head = |out, dir| checkout_head(out, dir, "/r/.git");
+        assert_eq!(head("/a\n/r/.git\nabc\n", "/a"), Some("abc".to_string()));
         // A removed worktree's path inside another checkout: git walks up to the enclosing repo.
-        assert_eq!(head_at_toplevel("/b\nabc\n", "/b/old-wt"), None);
-        assert_eq!(head_at_toplevel("/a", "/a"), None);
+        assert_eq!(head("/b\n/r/.git\nabc\n", "/b/old-wt"), None);
+        // The same path reused by a checkout of another repository.
+        assert_eq!(head("/a\n/other/.git\nabc\n", "/a"), None);
+        assert_eq!(head("/a\n/r/.git", "/a"), None);
     }
 
     #[test]
     fn the_reinstall_checkout_is_the_worktree_with_the_ref_checked_out() {
-        let porcelain = "worktree /repo\nHEAD 1111\nbranch refs/heads/feature\n\n\
-                         worktree /gone\nHEAD 2222\nbranch refs/heads/main\nprunable gitdir file points to non-existent location\n\n\
-                         worktree /wt\nHEAD 2222\nbranch refs/heads/main\n";
-        assert_eq!(checkout_of(porcelain, "refs/heads/main"), Some("/wt"));
+        let porcelain = "worktree /repo\0HEAD 1111\0branch refs/heads/feature\0\0\
+                         worktree /gone\0HEAD 2222\0branch refs/heads/main\0prunable gitdir file points to non-existent location\0\0\
+                         worktree /w\nt\0HEAD 2222\0branch refs/heads/main\0\0";
+        assert_eq!(checkout_of(porcelain, "refs/heads/main"), Some("/w\nt"));
         assert_eq!(checkout_of(porcelain, "refs/heads/other"), None);
-        let bare = "worktree /repo.git\nbare\n\nworktree /x\nHEAD 1\nbranch refs/heads/mainline\n";
+        let bare =
+            "worktree /repo.git\0bare\0\0worktree /x\0HEAD 1\0branch refs/heads/mainline\0\0";
         assert_eq!(checkout_of(bare, "refs/heads/main"), None);
     }
 

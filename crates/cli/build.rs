@@ -24,8 +24,8 @@ fn main() {
     //
     // `HEAD` is in the git dir, branch refs and `packed-refs` in the common dir. They differ in a
     // linked worktree, where a wrong path watches nothing and the commit silently stays old.
-    if let (Some(git_dir), Some(common_dir)) = (git_path("--git-dir"), git_path("--git-common-dir"))
-    {
+    let common_dir = git_path("--git-common-dir");
+    if let (Some(git_dir), Some(common_dir)) = (git_path("--git-dir"), &common_dir) {
         rerun_if_changed(&git_dir.join("HEAD"));
         // Loose ref for the current branch, and packed-refs for when it has been packed away.
         // A packed branch has no loose ref until the next commit creates one, so watch the
@@ -57,7 +57,7 @@ fn main() {
         commit.get(..7).unwrap_or(&commit)
     );
     println!("cargo:rustc-env=TASKFORGE_SOURCE_DIR={source}");
-    let common = git_path("--git-common-dir")
+    let common = common_dir
         .and_then(|p| p.canonicalize().ok())
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "unknown".into());
