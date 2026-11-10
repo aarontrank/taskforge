@@ -23,7 +23,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Provenance baked in by `build.rs`. See that file for why the commit is not optional decoration.
 const GIT_COMMIT: &str = env!("TASKFORGE_GIT_COMMIT");
 const SOURCE_DIR: &str = env!("TASKFORGE_SOURCE_DIR");
-const SOURCE_REPO: &str = env!("TASKFORGE_SOURCE_REPO");
+const GIT_COMMON_DIR: &str = env!("TASKFORGE_GIT_COMMON_DIR");
+/// What `doctor` compares against once git can no longer read the checkout the build ran in.
+const SOURCE_REF: &str = "refs/heads/main";
 const BUILD_EPOCH: &str = env!("TASKFORGE_BUILD_EPOCH");
 
 /// What `--version` prints: `0.3.0 (60610a0)`.
@@ -436,7 +438,7 @@ enum Freshness {
     Unknown(&'static str),
 }
 
-/// Compare the commit baked into this binary against the checkout's current HEAD.
+/// Compare the commit baked into this binary against the source's head.
 ///
 /// Pure, and separated from the `git` calls that feed it, because the interesting case — a stale
 /// binary — cannot be produced by a test that runs the binary it just built. The IO shell is
@@ -449,8 +451,9 @@ fn freshness(baked: &str, source_head: Option<&str>, counts: Option<(u32, u32)>)
         return Freshness::Unknown("this binary was built outside a git checkout");
     }
     match source_head {
-        None => Freshness::Unknown("the source checkout is missing or not a git repository"),
-        Some(head) if head == baked => Freshness::Fresh,
+        None => Freshness::Unknown(
+            "git can read neither the source checkout nor its repository's refs/heads/main",
+        ),
         Some(_) => match counts {
             Some((0, 0)) => Freshness::Fresh,
             Some((0, n)) => Freshness::Stale { behind: Some(n) },
@@ -469,16 +472,91 @@ fn parse_counts(s: &str) -> Option<(u32, u32)> {
     Some((l.parse().ok()?, r.parse().ok()?))
 }
 
-/// The checkout `doctor` compares against, with its HEAD: the one the binary was built in, else
-/// the repository's main working tree once git cannot read that one.
-fn locate_source(
-    candidates: [&str; 2],
-    head: impl Fn(&str) -> Option<String>,
-) -> Option<(&str, String)> {
-    candidates
-        .into_iter()
-        .filter(|d| *d != "unknown")
-        .find_map(|d| head(d).map(|h| (d, h)))
+/// What `doctor` compared the build against.
+#[derive(Debug, PartialEq)]
+struct Source {
+    head: String,
+    /// `Some(SOURCE_REF)` once git cannot read the checkout the build ran in.
+    reference: Option<&'static str>,
+    counts: Option<(u32, u32)>,
+    reinstall: Option<String>,
+}
+
+/// The checkout the build ran in while git can read it as a checkout, else `SOURCE_REF` read
+/// through the repository's common git dir. `git` runs git in a directory.
+fn locate(
+    built_in: &str,
+    common: &str,
+    baked: &str,
+    git: impl Fn(&str, &[&str]) -> Option<String>,
+) -> Option<Source> {
+    let count = |cwd: &str, flags: &[&str], rev: &str, head: &str| {
+        if head == baked {
+            return Some((0, 0));
+        }
+        let range = format!("{baked}...{rev}");
+        let args = [flags, &["rev-list", "--left-right", "--count", &range]].concat();
+        git(cwd, &args).and_then(|o| parse_counts(&o))
+    };
+    if built_in != "unknown" {
+        let head = git(built_in, &["rev-parse", "--show-toplevel", "HEAD"])
+            .and_then(|o| head_at_toplevel(&o, built_in));
+        if let Some(head) = head {
+            return Some(Source {
+                counts: count(built_in, &[], "HEAD", &head),
+                head,
+                reference: None,
+                reinstall: Some(built_in.to_string()),
+            });
+        }
+    }
+    if common == "unknown" || !std::path::Path::new(common).is_dir() {
+        return None;
+    }
+    let flags = ["--git-dir=."];
+    let head = git(
+        common,
+        &[
+            "--git-dir=.",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            SOURCE_REF,
+        ],
+    )?;
+    let reinstall = git(common, &["--git-dir=.", "worktree", "list", "--porcelain"])
+        .and_then(|o| checkout_of(&o, SOURCE_REF).map(str::to_string));
+    Some(Source {
+        counts: count(common, &flags, SOURCE_REF, &head),
+        head,
+        reference: Some(SOURCE_REF),
+        reinstall,
+    })
+}
+
+/// HEAD from `rev-parse --show-toplevel HEAD`, if the toplevel is `dir` itself.
+fn head_at_toplevel(out: &str, dir: &str) -> Option<String> {
+    let mut lines = out.lines();
+    (lines.next()? == dir).then_some(())?;
+    lines.next().map(str::to_string)
+}
+
+/// The worktree in `worktree list --porcelain` that has `reference` checked out.
+fn checkout_of<'a>(porcelain: &'a str, reference: &str) -> Option<&'a str> {
+    porcelain.split("\n\n").find_map(|entry| {
+        let mut path = None;
+        let mut on_ref = false;
+        for line in entry.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(p);
+            } else if line.strip_prefix("branch ") == Some(reference) {
+                on_ref = true;
+            } else if line.starts_with("prunable") {
+                return None;
+            }
+        }
+        path.filter(|_| on_ref)
+    })
 }
 
 /// Exit status for a verdict. Only staleness fails, so `doctor` can gate a script; `Unknown` is
@@ -929,27 +1007,23 @@ fn main() {
 /// a `git` subprocess per invocation is a real cost to pay for a check that changes daily at most.
 fn doctor() -> ! {
     let label = "doctor";
-    let located = locate_source([SOURCE_DIR, SOURCE_REPO], |d| {
-        git_in(d, &["rev-parse", "HEAD"])
-    });
-    let source_dir = located.as_ref().map_or(SOURCE_DIR, |(d, _)| *d);
-    let source_head = located.as_ref().map(|(_, h)| h.clone());
-    let counts = located
-        .and_then(|(d, _)| {
-            git_in(
-                d,
-                &[
-                    "rev-list",
-                    "--left-right",
-                    "--count",
-                    &format!("{GIT_COMMIT}...HEAD"),
-                ],
-            )
-        })
-        .and_then(|s| parse_counts(&s));
-    let verdict = freshness(GIT_COMMIT, source_head.as_deref(), counts);
-
-    let (state, note, behind) = report(&verdict, source_dir);
+    let source = locate(SOURCE_DIR, GIT_COMMON_DIR, GIT_COMMIT, git_in);
+    let source_head = source.as_ref().map(|s| s.head.clone());
+    let verdict = freshness(
+        GIT_COMMIT,
+        source_head.as_deref(),
+        source.as_ref().and_then(|s| s.counts),
+    );
+    let reference = source.as_ref().and_then(|s| s.reference);
+    let source_dir = match &source {
+        Some(s) => s.reinstall.as_deref(),
+        None => Some(SOURCE_DIR),
+    };
+    let source_version = source_dir.and_then(source_version);
+    let (state, note, behind) = report(
+        &verdict,
+        source.as_ref().and_then(|s| s.reinstall.as_deref()),
+    );
 
     let data = serde_json::json!({
         "state": state,
@@ -962,8 +1036,9 @@ fn doctor() -> ! {
         "source": {
             "dir": source_dir,
             "built_in": SOURCE_DIR,
+            "ref": reference,
             "commit": source_head,
-            "version": source_version(source_dir),
+            "version": source_version,
         },
         "behind": behind,
     });
@@ -981,12 +1056,13 @@ fn doctor() -> ! {
         );
         println!(
             "  source   {}  ({})",
-            source_version(source_dir).unwrap_or_else(|| "?".into()),
+            source_version.as_deref().unwrap_or("?"),
             source_head.as_deref().map_or("?", short)
         );
-        if source_dir != SOURCE_DIR && SOURCE_DIR != "unknown" {
+        if let Some(r) = reference {
             println!(
-                "  built in {SOURCE_DIR}, which git can no longer read; compared against {source_dir}"
+                "  compared against {r} in {GIT_COMMON_DIR}; built in {SOURCE_DIR}, which git can \
+                 no longer read"
             );
         }
         println!("  {}: {note}", state.to_uppercase());
@@ -994,7 +1070,14 @@ fn doctor() -> ! {
     std::process::exit(exit_code(&verdict))
 }
 
-fn report(verdict: &Freshness, reinstall: &str) -> (&'static str, String, Option<u32>) {
+fn report(verdict: &Freshness, reinstall: Option<&str>) -> (&'static str, String, Option<u32>) {
+    let how = match reinstall {
+        Some(d) => format!("reinstall from {d} with `cargo install --locked --path crates/cli`"),
+        None => format!(
+            "check out {SOURCE_REF} in a checkout of {GIT_COMMON_DIR} and reinstall from there \
+             with `cargo install --locked --path crates/cli`"
+        ),
+    };
     match verdict {
         Freshness::Fresh => (
             "fresh",
@@ -1005,14 +1088,12 @@ fn report(verdict: &Freshness, reinstall: &str) -> (&'static str, String, Option
             "stale",
             match behind {
                 Some(n) => format!(
-                    "the source is {n} commit{} ahead — reinstall from {reinstall} with \
-                     `cargo install --locked --path crates/cli`",
+                    "the source is {n} commit{} ahead — {how}",
                     if *n == 1 { "" } else { "s" }
                 ),
                 None => format!(
                     "the source has moved and git could not count the distance from this build's \
-                     commit — reinstall from {reinstall} with `cargo install --locked --path \
-                     crates/cli`"
+                     commit — {how}"
                 ),
             },
             *behind,
@@ -1713,15 +1794,6 @@ mod tests {
     }
 
     #[test]
-    fn the_same_commit_abbreviated_differently_is_fresh() {
-        // Git lengthens `--short` once a prefix becomes ambiguous.
-        assert_eq!(
-            freshness("abc1234", Some("abc12345"), Some((0, 0))),
-            Freshness::Fresh
-        );
-    }
-
-    #[test]
     fn a_binary_built_from_an_older_commit_is_stale() {
         assert_eq!(
             freshness("42471d8", Some("60610a0"), Some((0, 3))),
@@ -1780,43 +1852,125 @@ mod tests {
         ));
     }
 
+    /// A fake git: answers from `responses` by (dir, args joined with spaces) and records calls.
+    fn fake_git<'a>(
+        responses: &'a [(&'a str, &'a str, &'a str)],
+        calls: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&str, &[&str]) -> Option<String> + 'a {
+        move |dir, args| {
+            let cmd = format!("{dir}: {}", args.join(" "));
+            calls.borrow_mut().push(cmd);
+            responses
+                .iter()
+                .find(|(d, a, _)| *d == dir && *a == args.join(" "))
+                .map(|(_, _, out)| out.to_string())
+        }
+    }
+
+    fn existing_dir() -> String {
+        std::env::temp_dir().display().to_string()
+    }
+
     #[test]
     fn doctor_compares_against_the_checkout_it_was_built_in_while_it_exists() {
-        let head = |d: &str| (d == "/wt" || d == "/main").then(|| format!("head of {d}"));
+        let calls = Default::default();
+        let responses = [
+            ("/wt", "rev-parse --show-toplevel HEAD", "/wt\nbbbb"),
+            ("/wt", "rev-list --left-right --count aaaa...HEAD", "0\t2"),
+        ];
+        let common = existing_dir();
+        let s = locate("/wt", &common, "aaaa", fake_git(&responses, &calls)).unwrap();
         assert_eq!(
-            locate_source(["/wt", "/main"], head),
-            Some(("/wt", "head of /wt".to_string()))
+            s,
+            Source {
+                head: "bbbb".into(),
+                reference: None,
+                counts: Some((0, 2)),
+                reinstall: Some("/wt".into()),
+            }
+        );
+        assert_eq!(calls.borrow().len(), 2, "{calls:?}");
+    }
+
+    #[test]
+    fn a_fresh_build_spawns_git_once() {
+        let calls = Default::default();
+        let responses = [("/wt", "rev-parse --show-toplevel HEAD", "/wt\naaaa")];
+        let s = locate("/wt", "unknown", "aaaa", fake_git(&responses, &calls)).unwrap();
+        assert_eq!(s.counts, Some((0, 0)));
+        assert_eq!(calls.borrow().len(), 1, "{calls:?}");
+    }
+
+    #[test]
+    fn a_removed_worktree_compares_against_the_recorded_ref_not_a_checkout() {
+        let common = existing_dir();
+        let calls = Default::default();
+        let porcelain = "worktree /main\nHEAD 9999\nbranch refs/heads/feature\n\n\
+                         worktree /other\nHEAD cccc\nbranch refs/heads/main\n";
+        let responses = [
+            (
+                common.as_str(),
+                "--git-dir=. rev-parse --verify --quiet refs/heads/main",
+                "cccc",
+            ),
+            (
+                common.as_str(),
+                "--git-dir=. worktree list --porcelain",
+                porcelain,
+            ),
+            (
+                common.as_str(),
+                "--git-dir=. rev-list --left-right --count aaaa...refs/heads/main",
+                "0\t1",
+            ),
+        ];
+        let s = locate("/wt", &common, "aaaa", fake_git(&responses, &calls)).unwrap();
+        assert_eq!(
+            s,
+            Source {
+                head: "cccc".into(),
+                reference: Some("refs/heads/main"),
+                counts: Some((0, 1)),
+                reinstall: Some("/other".into()),
+            }
         );
     }
 
     #[test]
-    fn a_removed_worktree_falls_back_to_the_main_working_tree() {
-        let head = |d: &str| (d == "/main").then(|| "abc1234".to_string());
+    fn a_path_inside_another_checkout_is_not_the_build_checkout() {
+        let calls = Default::default();
+        let responses = [("/b/old-wt", "rev-parse --show-toplevel HEAD", "/b\nbbbb")];
         assert_eq!(
-            locate_source(["/wt", "/main"], head),
-            Some(("/main", "abc1234".to_string()))
+            locate("/b/old-wt", "unknown", "aaaa", fake_git(&responses, &calls)),
+            None
         );
     }
 
     #[test]
-    fn with_neither_checkout_readable_there_is_no_source() {
-        assert_eq!(locate_source(["/wt", "/main"], |_| None), None);
+    fn a_missing_common_dir_spawns_nothing_more() {
+        let calls = Default::default();
+        assert_eq!(
+            locate("/gone", "/gone/.git", "aaaa", fake_git(&[], &calls)),
+            None
+        );
+        assert_eq!(calls.borrow().len(), 1, "{calls:?}");
     }
 
     #[test]
     fn an_unrecorded_path_is_never_looked_up() {
         // `unknown` is what `build.rs` bakes when it found no path. Handed to git as a directory
         // it would resolve against the caller's working directory.
-        let head = |d: &str| {
-            assert_ne!(d, "unknown", "looked up the placeholder as a path");
+        let calls = Default::default();
+        assert_eq!(
+            locate("unknown", "unknown", "aaaa", fake_git(&[], &calls)),
             None
-        };
-        assert_eq!(locate_source(["unknown", "unknown"], head), None);
+        );
+        assert!(calls.borrow().is_empty(), "{calls:?}");
     }
 
     #[test]
     fn a_fresh_report_is_zero_behind() {
-        let (state, note, behind) = report(&Freshness::Fresh, "/src");
+        let (state, note, behind) = report(&Freshness::Fresh, Some("/src"));
         assert_eq!(state, "fresh");
         assert_eq!(note, "this binary is built from the current source");
         assert_eq!(behind, Some(0));
@@ -1824,7 +1978,7 @@ mod tests {
 
     #[test]
     fn a_stale_report_counts_the_distance_and_names_the_reinstall() {
-        let (state, note, behind) = report(&Freshness::Stale { behind: Some(3) }, "/src");
+        let (state, note, behind) = report(&Freshness::Stale { behind: Some(3) }, Some("/src"));
         assert_eq!(state, "stale");
         assert_eq!(
             note,
@@ -1832,13 +1986,13 @@ mod tests {
              `cargo install --locked --path crates/cli`"
         );
         assert_eq!(behind, Some(3));
-        let (_, note, _) = report(&Freshness::Stale { behind: Some(1) }, "/src");
+        let (_, note, _) = report(&Freshness::Stale { behind: Some(1) }, Some("/src"));
         assert!(note.starts_with("the source is 1 commit ahead "), "{note}");
     }
 
     #[test]
     fn an_uncounted_stale_report_is_null_behind_and_still_names_the_reinstall() {
-        let (state, note, behind) = report(&Freshness::Stale { behind: None }, "/src");
+        let (state, note, behind) = report(&Freshness::Stale { behind: None }, Some("/src"));
         assert_eq!(state, "stale");
         assert_eq!(
             note,
@@ -1850,10 +2004,38 @@ mod tests {
 
     #[test]
     fn an_unknown_report_is_null_behind_and_its_reason() {
-        let (state, note, behind) = report(&Freshness::Unknown("why"), "/src");
+        let (state, note, behind) = report(&Freshness::Unknown("why"), Some("/src"));
         assert_eq!(state, "unknown");
         assert_eq!(note, "why");
         assert_eq!(behind, None);
+    }
+
+    #[test]
+    fn a_stale_report_with_no_checkout_of_the_ref_names_no_directory() {
+        for behind in [Some(2), None] {
+            let (_, note, _) = report(&Freshness::Stale { behind }, None);
+            assert!(!note.contains("reinstall from /"), "{note}");
+            assert!(note.contains("check out refs/heads/main"), "{note}");
+        }
+    }
+
+    #[test]
+    fn a_checkout_counts_only_as_its_own_toplevel() {
+        assert_eq!(head_at_toplevel("/a\nabc\n", "/a"), Some("abc".to_string()));
+        // A removed worktree's path inside another checkout: git walks up to the enclosing repo.
+        assert_eq!(head_at_toplevel("/b\nabc\n", "/b/old-wt"), None);
+        assert_eq!(head_at_toplevel("/a", "/a"), None);
+    }
+
+    #[test]
+    fn the_reinstall_checkout_is_the_worktree_with_the_ref_checked_out() {
+        let porcelain = "worktree /repo\nHEAD 1111\nbranch refs/heads/feature\n\n\
+                         worktree /gone\nHEAD 2222\nbranch refs/heads/main\nprunable gitdir file points to non-existent location\n\n\
+                         worktree /wt\nHEAD 2222\nbranch refs/heads/main\n";
+        assert_eq!(checkout_of(porcelain, "refs/heads/main"), Some("/wt"));
+        assert_eq!(checkout_of(porcelain, "refs/heads/other"), None);
+        let bare = "worktree /repo.git\nbare\n\nworktree /x\nHEAD 1\nbranch refs/heads/mainline\n";
+        assert_eq!(checkout_of(bare, "refs/heads/main"), None);
     }
 
     #[test]

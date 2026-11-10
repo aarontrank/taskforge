@@ -82,10 +82,16 @@ taskforge doctor --json                   # compares that commit against its sou
 
 Only `stale` exits non-zero, so `doctor` can gate a script.
 
-`source.dir` is the checkout `doctor` compared against, and `source.built_in` the one the binary was
-built in. They differ only when git can no longer read the checkout the binary was built in,
-typically a linked worktree removed after its branch merged. `doctor` then compares against the
-repository's main working tree, whatever branch that has checked out, by the same rules.
+`source.built_in` is the checkout the binary was built in. While git can read it as a checkout,
+`doctor` compares against its HEAD: `source.dir` is that checkout and `source.ref` is `null`. Once
+git cannot, typically a linked worktree removed after its branch merged, `doctor` compares against
+`refs/heads/main` read from the repository itself, by the same rules, whatever branch any checkout
+has out. `source.ref` is then `"refs/heads/main"`, and `source.dir` the checkout that has `main`
+checked out, which `note` says to reinstall from. When no checkout has `main` checked out,
+`source.dir` and `source.version` are `null`, and `note` says to check `main` out first.
+
+`binary.commit` and `source.commit` are full shas. `--version` and the text output show the first
+seven characters.
 
 **Run this before trusting that a flag is missing.** A command erroring with *unexpected argument*
 is far more often a stale install than a flag that does not exist: `--stale`, `--overdue` and
