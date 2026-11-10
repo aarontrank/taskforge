@@ -46,12 +46,16 @@ fn main() {
         rerun_if_changed(&common_dir.join("reftable"));
     }
 
-    let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let source = root
         .map(|r| r.display().to_string())
         .unwrap_or_else(|| "unknown".into());
 
     println!("cargo:rustc-env=TASKFORGE_GIT_COMMIT={commit}");
+    println!(
+        "cargo:rustc-env=TASKFORGE_GIT_COMMIT_SHORT={}",
+        &commit[..7]
+    );
     println!("cargo:rustc-env=TASKFORGE_SOURCE_DIR={source}");
     let repo = main_worktree().unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=TASKFORGE_SOURCE_REPO={repo}");

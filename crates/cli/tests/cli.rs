@@ -2372,6 +2372,22 @@ fn doctor_reports_this_test_binary_as_fresh() {
 }
 
 #[test]
+fn doctor_compares_and_reports_full_shas() {
+    let d = setup();
+    let (_, v) = run(d.path(), &["doctor", "--json"]);
+    if !built_in_a_checkout(&v) {
+        return;
+    }
+    for side in ["binary", "source"] {
+        let sha = v["data"][side]["commit"].as_str().unwrap_or_default();
+        assert!(
+            sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "{side}.commit must be a full sha: {v}"
+        );
+    }
+}
+
+#[test]
 fn doctor_reports_where_the_source_is_and_when_the_binary_was_built() {
     // Without these a stale verdict is a dead end: you know something is wrong and not which
     // checkout to reinstall from.

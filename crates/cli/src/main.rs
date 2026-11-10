@@ -34,7 +34,7 @@ const BUILD_EPOCH: &str = env!("TASKFORGE_BUILD_EPOCH");
 const VERSION_WITH_COMMIT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
-    env!("TASKFORGE_GIT_COMMIT"),
+    env!("TASKFORGE_GIT_COMMIT_SHORT"),
     ")"
 );
 
@@ -930,7 +930,7 @@ fn main() {
 fn doctor() -> ! {
     let label = "doctor";
     let located = locate_source([SOURCE_DIR, SOURCE_REPO], |d| {
-        git_in(d, &["rev-parse", "--short=7", "HEAD"])
+        git_in(d, &["rev-parse", "HEAD"])
     });
     let source_dir = located.as_ref().map_or(SOURCE_DIR, |(d, _)| *d);
     let source_head = located.as_ref().map(|(_, h)| h.clone());
@@ -975,13 +975,14 @@ fn doctor() -> ! {
         println!("{}", serde_json::to_string_pretty(&env).unwrap_or_default());
     } else {
         println!(
-            "  binary   {VERSION} ({GIT_COMMIT})  built {}",
+            "  binary   {VERSION} ({})  built {}",
+            short(GIT_COMMIT),
             build_time()
         );
         println!(
             "  source   {}  ({})",
             source_version(source_dir).unwrap_or_else(|| "?".into()),
-            source_head.as_deref().unwrap_or("?")
+            source_head.as_deref().map_or("?", short)
         );
         if source_dir != SOURCE_DIR && SOURCE_DIR != "unknown" {
             println!(
@@ -1018,6 +1019,10 @@ fn report(verdict: &Freshness, reinstall: &str) -> (&'static str, String, Option
         ),
         Freshness::Unknown(why) => ("unknown", (*why).to_string(), None),
     }
+}
+
+fn short(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 /// Run git inside a directory, or `None` if git is absent, the directory is gone, or it failed.
