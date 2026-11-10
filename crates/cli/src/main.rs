@@ -25,6 +25,8 @@ const GIT_COMMIT: &str = env!("TASKFORGE_GIT_COMMIT");
 const SOURCE_DIR: &str = env!("TASKFORGE_SOURCE_DIR");
 const GIT_COMMON_DIR: &str = env!("TASKFORGE_GIT_COMMON_DIR");
 /// What `doctor` compares against once git can no longer read the checkout the build ran in.
+// kiss: a literal, so a repository whose trunk is not `main` reads `unknown` once the build's
+// checkout is gone. Record the trunk in build.rs if taskforge is ever built from such a repository.
 const SOURCE_REF: &str = "refs/heads/main";
 const BUILD_EPOCH: &str = env!("TASKFORGE_BUILD_EPOCH");
 
@@ -536,7 +538,8 @@ fn locate(
 /// the repository is `common`.
 fn checkout_head(out: &str, dir: &str, common: &str) -> Option<String> {
     let mut lines = out.lines();
-    (lines.next()? == dir && lines.next()? == common).then_some(())?;
+    let (top, git_common) = (lines.next()?, lines.next()?);
+    (top == dir && (common == "unknown" || git_common == common)).then_some(())?;
     lines.next().map(str::to_string)
 }
 
@@ -1106,7 +1109,24 @@ fn short(sha: &str) -> &str {
 
 /// Run git inside a directory, or `None` if git is absent, the directory is gone, or it failed.
 fn git_in(dir: &str, args: &[&str]) -> Option<String> {
+    // `git rev-parse --local-env-vars`: a hook exports these for its own repository, and they
+    // would override `current_dir`.
     let out = std::process::Command::new("git")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_IMPLICIT_WORK_TREE")
+        .env_remove("GIT_GRAFT_FILE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_NO_REPLACE_OBJECTS")
+        .env_remove("GIT_REPLACE_REF_BASE")
+        .env_remove("GIT_PREFIX")
+        .env_remove("GIT_SHALLOW_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .args(args)
         .current_dir(dir)
         .output()
@@ -2092,6 +2112,10 @@ mod tests {
         // The same path reused by a checkout of another repository.
         assert_eq!(head("/a\n/other/.git\nabc\n", "/a"), None);
         assert_eq!(head("/a\n/r/.git", "/a"), None);
+        assert_eq!(
+            checkout_head("/a\n/r/.git\nabc", "/a", "unknown"),
+            Some("abc".to_string())
+        );
     }
 
     #[test]

@@ -69,7 +69,7 @@ fails with `OWNER_NOT_FOUND`.
 
 ```bash
 taskforge --version                       # 0.3.0 (60610a0) — semver plus the commit it was built from
-taskforge doctor --json                   # compares that commit against its source checkout
+taskforge doctor --json                   # compares that commit against its source
 ```
 
 `doctor` reports `state` as one of:
@@ -88,7 +88,9 @@ git cannot, typically a linked worktree removed after its branch merged, `doctor
 `refs/heads/main` read from the repository itself, by the same rules, whatever branch any checkout
 has out. `source.ref` is then `"refs/heads/main"`, and `source.dir` the checkout that has `main`
 checked out, which `note` says to reinstall from. When no checkout has `main` checked out,
-`source.dir` and `source.version` are `null`, and `note` says to check `main` out first.
+`source.dir` and `source.version` are `null`, and `note` says to check `main` out first. When git
+can read neither, `state` is `unknown`, `source.commit` is `null` and `source.dir` repeats
+`source.built_in`, which was not compared.
 
 `binary.commit` and `source.commit` are full shas when known: a build outside a git checkout has
 `binary.commit` `"unknown"`, and `source.commit` is `null` when git could read no source.

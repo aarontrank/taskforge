@@ -2388,6 +2388,25 @@ fn doctor_compares_and_reports_full_shas() {
 }
 
 #[test]
+fn doctor_ignores_a_git_dir_inherited_from_the_environment() {
+    // As inside another repository's git hook.
+    let d = setup();
+    let out = Command::new(env!("CARGO_BIN_EXE_taskforge"))
+        .args(["doctor", "--json"])
+        .env("TASKFORGE_ROOT", d.path())
+        .env("GIT_DIR", d.path().join("not-a-repo"))
+        .env("GIT_WORK_TREE", d.path())
+        .output()
+        .expect("binary runs");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    if !built_in_a_checkout(&v) {
+        return;
+    }
+    assert_eq!(v["data"]["state"], "fresh", "{v}");
+    assert_eq!(v["data"]["source"]["ref"], serde_json::Value::Null, "{v}");
+}
+
+#[test]
 fn doctor_reports_where_the_source_is_and_when_the_binary_was_built() {
     // Without these a stale verdict is a dead end: you know something is wrong and not which
     // checkout to reinstall from.
