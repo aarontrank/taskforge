@@ -1733,8 +1733,7 @@ mod tests {
 
     #[test]
     fn a_build_with_commits_the_source_lacks_is_unknown() {
-        // Unmerged, squash-merged, rebased, or ahead of an unpulled checkout: history cannot tell
-        // these apart, and calling them stale would exit 1 on a build that may be newest.
+        // Unmerged, squash-merged, rebased, or ahead of an unpulled checkout.
         for counts in [(1, 0), (2, 5)] {
             assert!(
                 matches!(
