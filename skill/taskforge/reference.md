@@ -76,7 +76,7 @@ taskforge doctor --json                   # compares that commit against its sou
 
 | `state` | Meaning | Exit |
 |---|---|---|
-| `fresh` | The binary was built from the checkout's current HEAD | 0 |
+| `fresh` | The binary was built from the source's current head (which source: see below) | 0 |
 | `stale` | The source has moved since this binary was built. `note` carries the reinstall command and `behind` the commit count. `behind` is `null` when git could not count the distance, usually because it no longer has the build's commit | 1 |
 | `unknown` | Built outside a git checkout, the source is gone, or the build has commits the source's history lacks (an unmerged or squash-merged branch, a rebase, or a source checkout that is behind). Nothing can be concluded, which is not the same as "fine": after a squash merge a stale binary reads `unknown` | 0 |
 
@@ -90,8 +90,9 @@ has out. `source.ref` is then `"refs/heads/main"`, and `source.dir` the checkout
 checked out, which `note` says to reinstall from. When no checkout has `main` checked out,
 `source.dir` and `source.version` are `null`, and `note` says to check `main` out first.
 
-`binary.commit` and `source.commit` are full shas. `--version` and the text output show the first
-seven characters.
+`binary.commit` and `source.commit` are full shas when known: a build outside a git checkout has
+`binary.commit` `"unknown"`, and `source.commit` is `null` when git could read no source.
+`--version` and the text output show the first seven characters.
 
 **Run this before trusting that a flag is missing.** A command erroring with *unexpected argument*
 is far more often a stale install than a flag that does not exist: `--stale`, `--overdue` and
