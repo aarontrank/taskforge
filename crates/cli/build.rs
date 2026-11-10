@@ -54,7 +54,7 @@ fn main() {
     println!("cargo:rustc-env=TASKFORGE_GIT_COMMIT={commit}");
     println!(
         "cargo:rustc-env=TASKFORGE_GIT_COMMIT_SHORT={}",
-        &commit[..7]
+        commit.get(..7).unwrap_or(&commit)
     );
     println!("cargo:rustc-env=TASKFORGE_SOURCE_DIR={source}");
     let common = git_path("--git-common-dir")

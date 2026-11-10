@@ -514,17 +514,9 @@ fn locate(
         return None;
     }
     let flags = ["--git-dir=."];
-    let head = git(
-        common,
-        &[
-            "--git-dir=.",
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            SOURCE_REF,
-        ],
-    )?;
-    let reinstall = git(common, &["--git-dir=.", "worktree", "list", "--porcelain"])
+    let in_common = |args: &[&str]| git(common, &[&flags[..], args].concat());
+    let head = in_common(&["rev-parse", "--verify", "--quiet", SOURCE_REF])?;
+    let reinstall = in_common(&["worktree", "list", "--porcelain"])
         .and_then(|o| checkout_of(&o, SOURCE_REF).map(str::to_string));
     Some(Source {
         counts: count(common, &flags, SOURCE_REF, &head),
@@ -1015,15 +1007,14 @@ fn doctor() -> ! {
         source.as_ref().and_then(|s| s.counts),
     );
     let reference = source.as_ref().and_then(|s| s.reference);
-    let source_dir = match &source {
-        Some(s) => s.reinstall.as_deref(),
-        None => Some(SOURCE_DIR),
+    let reinstall = source.as_ref().and_then(|s| s.reinstall.as_deref());
+    let source_dir = if source.is_some() {
+        reinstall
+    } else {
+        Some(SOURCE_DIR)
     };
-    let source_version = source_dir.and_then(source_version);
-    let (state, note, behind) = report(
-        &verdict,
-        source.as_ref().and_then(|s| s.reinstall.as_deref()),
-    );
+    let source_version = reinstall.and_then(source_version);
+    let (state, note, behind) = report(&verdict, reinstall);
 
     let data = serde_json::json!({
         "state": state,
@@ -1061,8 +1052,8 @@ fn doctor() -> ! {
         );
         if let Some(r) = reference {
             println!(
-                "  compared against {r} in {GIT_COMMON_DIR}; built in {SOURCE_DIR}, which git can \
-                 no longer read"
+                "  compared against {r} in {GIT_COMMON_DIR}; built in {SOURCE_DIR}, which is no \
+                 longer a checkout git can read"
             );
         }
         println!("  {}: {note}", state.to_uppercase());
@@ -1934,6 +1925,49 @@ mod tests {
                 reinstall: Some("/other".into()),
             }
         );
+    }
+
+    #[test]
+    fn the_fallback_reads_the_ref_through_real_git() {
+        let d = tempfile::tempdir().unwrap();
+        let top = d.path().canonicalize().unwrap();
+        let repo = top.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = repo.to_str().unwrap();
+        let g = |args: &[&str]| {
+            let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+            git_in(repo, &[&id[..], args].concat())
+        };
+        if g(&["--version"]).is_none() {
+            return;
+        }
+        g(&["init", "-q", "-b", "main"]).unwrap_or_default();
+        g(&["commit", "-q", "--allow-empty", "-m", "built"]).unwrap_or_default();
+        let baked = g(&["rev-parse", "HEAD"]).unwrap();
+        g(&["commit", "-q", "--allow-empty", "-m", "m1"]).unwrap_or_default();
+        let main = g(&["rev-parse", "HEAD"]).unwrap();
+        g(&["checkout", "-q", "-b", "other"]).unwrap_or_default();
+        g(&["commit", "-q", "--allow-empty", "-m", "o1"]).unwrap_or_default();
+        let common = top.join("repo/.git");
+        let common = common.to_str().unwrap();
+        let gone = top.join("wt");
+        let gone = gone.to_str().unwrap();
+
+        let s = locate(gone, common, &baked, git_in).unwrap();
+        assert_eq!(
+            s,
+            Source {
+                head: main.clone(),
+                reference: Some("refs/heads/main"),
+                counts: Some((0, 1)),
+                reinstall: None,
+            }
+        );
+
+        let wt2 = top.join("wt2");
+        g(&["worktree", "add", "-q", wt2.to_str().unwrap(), "main"]).unwrap_or_default();
+        let s = locate(gone, common, &baked, git_in).unwrap();
+        assert_eq!(s.reinstall.as_deref(), wt2.to_str());
     }
 
     #[test]

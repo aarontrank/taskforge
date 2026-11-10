@@ -2381,7 +2381,7 @@ fn doctor_compares_and_reports_full_shas() {
     for side in ["binary", "source"] {
         let sha = v["data"][side]["commit"].as_str().unwrap_or_default();
         assert!(
-            sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+            (sha.len() == 40 || sha.len() == 64) && sha.chars().all(|c| c.is_ascii_hexdigit()),
             "{side}.commit must be a full sha: {v}"
         );
     }
