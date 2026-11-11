@@ -24,8 +24,8 @@ fn main() {
     //
     // `HEAD` is in the git dir, branch refs and `packed-refs` in the common dir. They differ in a
     // linked worktree, where a wrong path watches nothing and the commit silently stays old.
-    if let (Some(git_dir), Some(common_dir)) = (git_path("--git-dir"), git_path("--git-common-dir"))
-    {
+    let common_dir = git_path("--git-common-dir");
+    if let (Some(git_dir), Some(common_dir)) = (git_path("--git-dir"), &common_dir) {
         rerun_if_changed(&git_dir.join("HEAD"));
         // Loose ref for the current branch, and packed-refs for when it has been packed away.
         // A packed branch has no loose ref until the next commit creates one, so watch the
@@ -46,15 +46,22 @@ fn main() {
         rerun_if_changed(&common_dir.join("reftable"));
     }
 
-    let commit = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let source = root
         .map(|r| r.display().to_string())
         .unwrap_or_else(|| "unknown".into());
 
     println!("cargo:rustc-env=TASKFORGE_GIT_COMMIT={commit}");
+    println!(
+        "cargo:rustc-env=TASKFORGE_GIT_COMMIT_SHORT={}",
+        commit.get(..7).unwrap_or(&commit)
+    );
     println!("cargo:rustc-env=TASKFORGE_SOURCE_DIR={source}");
-    let repo = main_worktree().unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=TASKFORGE_SOURCE_REPO={repo}");
+    let common = common_dir
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=TASKFORGE_GIT_COMMON_DIR={common}");
     println!("cargo:rustc-env=TASKFORGE_BUILD_EPOCH={}", build_epoch());
 }
 
@@ -67,16 +74,6 @@ fn rerun_if_changed(p: &std::path::Path) {
 /// The checkout this build came from, so `doctor` knows where to look for newer commits.
 fn repo_root() -> Option<std::path::PathBuf> {
     git(&["rev-parse", "--show-toplevel"]).map(std::path::PathBuf::from)
-}
-
-/// The repository's main working tree, which outlives a linked worktree the build ran in. For a
-/// bare repository this is the bare directory, where git still reads HEAD.
-fn main_worktree() -> Option<String> {
-    git(&["worktree", "list", "--porcelain"])?
-        .lines()
-        .next()?
-        .strip_prefix("worktree ")
-        .map(str::to_string)
 }
 
 /// A directory `git rev-parse <flag>` names. Git may answer relative to where it ran.

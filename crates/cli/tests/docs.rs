@@ -243,7 +243,7 @@ fn every_code_the_cli_can_emit_is_documented() {
     // Derived from the source instead of a hand-kept allowlist: the allowlist version failed the
     // first time a new `env!` was added, which is the same "someone has to remember" that this
     // whole test exists to remove.
-    let env_names: BTreeSet<&str> = ["env!(\"", "env::var(\""]
+    let env_names: BTreeSet<&str> = ["env!(\"", "env::var(\"", "env_remove(\""]
         .iter()
         .flat_map(|pat| {
             source.match_indices(pat).filter_map(|(i, m)| {

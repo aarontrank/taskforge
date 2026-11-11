@@ -69,23 +69,32 @@ fails with `OWNER_NOT_FOUND`.
 
 ```bash
 taskforge --version                       # 0.3.0 (60610a0) — semver plus the commit it was built from
-taskforge doctor --json                   # compares that commit against its source checkout
+taskforge doctor --json                   # compares that commit against its source
 ```
 
 `doctor` reports `state` as one of:
 
 | `state` | Meaning | Exit |
 |---|---|---|
-| `fresh` | The binary was built from the checkout's current HEAD | 0 |
+| `fresh` | The binary was built from the source's current head (which source: see below) | 0 |
 | `stale` | The source has moved since this binary was built. `note` carries the reinstall command and `behind` the commit count. `behind` is `null` when git could not count the distance, usually because it no longer has the build's commit | 1 |
 | `unknown` | Built outside a git checkout, the source is gone, or the build has commits the source's history lacks (an unmerged or squash-merged branch, a rebase, or a source checkout that is behind). Nothing can be concluded, which is not the same as "fine": after a squash merge a stale binary reads `unknown` | 0 |
 
 Only `stale` exits non-zero, so `doctor` can gate a script.
 
-`source.dir` is the checkout `doctor` compared against, and `source.built_in` the one the binary was
-built in. They differ only when git can no longer read the checkout the binary was built in,
-typically a linked worktree removed after its branch merged. `doctor` then compares against the
-repository's main working tree, whatever branch that has checked out, by the same rules.
+`source.built_in` is the checkout the binary was built in. While git can read it as a checkout,
+`doctor` compares against its HEAD: `source.dir` is that checkout and `source.ref` is `null`. Once
+git cannot, typically a linked worktree removed after its branch merged, `doctor` compares against
+`refs/heads/main` read from the repository itself, by the same rules, whatever branch any checkout
+has out. `source.ref` is then `"refs/heads/main"`, and `source.dir` the checkout that has `main`
+checked out, which `note` says to reinstall from. When no checkout has `main` checked out,
+`source.dir` and `source.version` are `null`, and `note` says to check `main` out first. When git
+can read neither, `state` is `unknown`, `source.commit` is `null` and `source.dir` repeats
+`source.built_in`, which was not compared.
+
+`binary.commit` and `source.commit` are full shas when known: a build outside a git checkout has
+`binary.commit` `"unknown"`, and `source.commit` is `null` when git could read no source.
+`--version` and the text output show the first seven characters.
 
 **Run this before trusting that a flag is missing.** A command erroring with *unexpected argument*
 is far more often a stale install than a flag that does not exist: `--stale`, `--overdue` and
